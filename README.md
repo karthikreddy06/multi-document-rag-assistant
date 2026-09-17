@@ -159,8 +159,8 @@ rag-project/
 
 ### 1. Clone Repository
 ```powershell
-git clone https://github.com/YOUR_USERNAME/rag-project.git
-cd rag-project
+git clone https://github.com/karthikreddy06/multi-document-rag-assistant.git
+cd multi-document-rag-assistant
 ```
 
 ### 2. Create and Activate Virtual Environment
