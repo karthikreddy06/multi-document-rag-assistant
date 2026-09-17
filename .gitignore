@@ -25,10 +25,13 @@ ENV/
 .env.local
 .env.*.local
 *.env
+**/.env
 !.env.example
+!backend/.env.example
 
 # Vector Database / Runtime Data
 chroma_db/
+**/chroma_db/
 *.chroma
 *.sqlite3
 
@@ -58,3 +61,6 @@ $RECYCLE.BIN/
 
 # Personal / Private Documents (Exclude PII from public release)
 documents/company.pdf
+backend/documents/company.pdf
+**/documents/company.pdf
+
