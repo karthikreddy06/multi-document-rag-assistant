@@ -79,7 +79,14 @@ class IngestionPipeline:
         Synchronize all PDF files from the documents directory into ChromaDB.
         Automatically cleans up stale chunks from deleted files and re-indexes modified files.
         """
-        target_dir = Path(dir_path or settings.documents_dir).resolve()
+        # Resolve relative paths against the backend directory (where documents live)
+        # to maintain backward compatibility with tests passing "documents"
+        path_obj = Path(dir_path or settings.documents_dir)
+        if not path_obj.is_absolute():
+            # Backend directory is parent of app/ (i.e., backend/app/ -> backend/)
+            backend_dir = Path(__file__).resolve().parent.parent.parent
+            path_obj = backend_dir / path_obj
+        target_dir = path_obj.resolve()
         if not target_dir.exists():
             raise FileNotFoundError(f"Documents directory does not exist: {target_dir}")
 

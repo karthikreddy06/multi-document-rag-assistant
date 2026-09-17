@@ -5,8 +5,15 @@ Loads settings from environment variables or .env file with sensible production 
 
 import os
 from pathlib import Path
+from typing import List
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic import Field
+
+
+# Project root is the parent of the backend directory (where this config.py's grandparent is)
+# config.py -> backend/app/ -> backend/ -> project_root/
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+_BACKEND_DIR = Path(__file__).resolve().parent.parent
 
 
 class Settings(BaseSettings):
@@ -16,10 +23,11 @@ class Settings(BaseSettings):
     llm_model: str = Field(default="llama3.2", alias="LLM_MODEL")
     ollama_timeout: float = Field(default=60.0, alias="OLLAMA_TIMEOUT")
 
-    # Storage settings
-    chroma_path: str = Field(default="./chroma_db", alias="CHROMA_PATH")
+    # Storage settings - defaults relative to project structure
+    # chroma_db is at project root, documents is in backend/
+    chroma_path: str = Field(default=str(_PROJECT_ROOT / "chroma_db"), alias="CHROMA_PATH")
     collection_name: str = Field(default="documents", alias="COLLECTION_NAME")
-    documents_dir: str = Field(default="./documents", alias="DOCUMENTS_DIR")
+    documents_dir: str = Field(default=str(_BACKEND_DIR / "documents"), alias="DOCUMENTS_DIR")
 
     # Chunking settings
     chunk_size: int = Field(default=800, alias="CHUNK_SIZE")
@@ -27,6 +35,17 @@ class Settings(BaseSettings):
 
     # Retrieval settings
     top_k: int = Field(default=5, alias="TOP_K")
+
+    # API & CORS settings
+    cors_origins: List[str] = Field(
+        default=[
+            "http://localhost:3000",
+            "http://localhost:5173",
+            "http://127.0.0.1:3000",
+            "http://127.0.0.1:5173",
+        ],
+        alias="CORS_ORIGINS"
+    )
 
     # Logging settings
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")

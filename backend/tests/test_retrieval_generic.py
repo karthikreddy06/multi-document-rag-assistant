@@ -13,7 +13,7 @@ def retriever():
     vs = VectorStore()
     if vs.count() == 0:
         pytest.skip("ChromaDB collection is empty. Ingestion required.")
-    return HybridRetriever(top_k=5)
+    return HybridRetriever(vector_store=vs, top_k=5)
 
 
 # --- Query Decomposition Unit Tests ---

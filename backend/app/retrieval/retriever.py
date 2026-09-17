@@ -517,7 +517,8 @@ class HybridRetriever:
         where_filter = {"filename": target_doc} if target_doc else None
 
         # Pull enough candidates for robust hybrid re-ranking across multi-document collections
-        candidate_k = min(max(k * 8, 40), total_chunks)
+        # Increased minimum to 60 to work around ChromaDB HNSW ef_search=10 limitation
+        candidate_k = min(max(k * 8, 60), total_chunks)
         raw_results = self.vector_store.query(
             query_embedding=query_embedding,
             top_k=candidate_k,
