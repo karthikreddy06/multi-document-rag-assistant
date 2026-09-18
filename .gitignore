@@ -34,12 +34,19 @@ chroma_db/
 **/chroma_db/
 *.chroma
 *.sqlite3
+*.db
+*.db-wal
+*.db-shm
+backend/data/
+data/
+**/data/
 
 # Logs
 *.log
 logs/
 
 # Archives & Temporary Artifacts
+scratch/
 *.zip
 *.tar.gz
 *.tmp

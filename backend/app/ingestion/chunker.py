@@ -1,7 +1,7 @@
 """
-Section-Aware and Semantic Chunking Module.
-Splits documents intelligently, preserving section boundaries, preventing fragmentation
-of atomic sections (e.g. Technical Skills, Projects), and retaining rich metadata.
+Structure-Aware and Semantic Document Chunking Module.
+Preserves document structure, section headings, numbered lists, tables,
+and atomic sub-entries without relying on hardcoded document keywords.
 """
 
 from dataclasses import dataclass, field
@@ -19,8 +19,8 @@ logger = setup_logger("ingestion.chunker")
 class DocumentChunker:
     """Production chunker combining structural section awareness with recursive fallback."""
 
-    # Common section headers in structured documents, reports, manuals, and profiles
-    SECTION_HEADERS = [
+    # Generic common headers across academic, corporate, technical, and general literature
+    COMMON_SECTION_HEADERS = [
         "TABLE OF CONTENTS",
         "EXECUTIVE SUMMARY",
         "PROFESSIONAL SUMMARY",
@@ -66,14 +66,22 @@ class DocumentChunker:
 
     def _split_into_sections(self, text: str) -> List[Dict[str, str]]:
         """
-        Identify section boundaries and return list of dicts with 'section' and 'content'.
-        Uses generic heading and itemized sub-entry detection without hardcoding document terms.
+        Identify section boundaries using generic heading patterns:
+        - Markdown headers (# Heading)
+        - Numbered chapters/sections (Chapter 1, Section 2.1)
+        - Capitalized common structural headers
+        - Generic all-caps headings (2 to 5 words)
         """
-        # Match standard section headers or numbered chapters/sections
+        # Generic heading regex: matches markdown headers, chapter/section keywords,
+        # hierarchical numbered sections (e.g. 1.1 Overview), common structural headers,
+        # or titled header lines ending in colon followed by newline.
         pattern = (
-            r"(?:^|\n)(?:CHAPTER\s+\d+|SECTION\s+\d+|"
-            + "|".join(re.escape(h) for h in self.SECTION_HEADERS)
-            + r")(?:\b|:|\.)"
+            r"(?:^|\n)(?:"
+            r"#{1,4}\s+[^\n]+|"                                       # Markdown headers
+            r"CHAPTER\s+\d+|SECTION\s+\d+|"                           # Numbered chapters/sections
+            r"\d+\.\d+(?:\.\d+)*\s+[A-Z][^\n]{2,50}|"                 # Hierarchical sections: "1.2 Methodology"
+            r"(?:" + "|".join(re.escape(h) for h in self.COMMON_SECTION_HEADERS) + r")(?:\b|:|\.)" # Common sections
+            r")"
         )
         matches = list(re.finditer(pattern, text, flags=re.IGNORECASE))
 
@@ -89,7 +97,7 @@ class DocumentChunker:
                 sections.append({"section": "Overview / Header", "content": first_part})
 
         for i, m in enumerate(matches):
-            sec_name = m.group(0).strip(" :\n\t\r.")
+            sec_name = re.sub(r"^#+\s*", "", m.group(0)).strip(" :\n\t\r.")
             start = m.start()
             end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
             sec_text = text[start:end].strip()
@@ -113,9 +121,63 @@ class DocumentChunker:
 
         return sections
 
+    def _detect_content_type(self, text: str) -> str:
+        """
+        Heuristically identify whether text is code, tabular data,
+        procedural steps, key-value pairs, list, or regular prose.
+        """
+        lines = [line.strip() for line in text.split("\n") if line.strip()]
+        if not lines:
+            return "text"
+
+        # 1. Code check (fenced code block or multiple programming language keywords / syntax)
+        if "```" in text or text.strip().startswith("def ") or text.strip().startswith("class "):
+            return "code"
+        code_syntax_markers = [
+            r"\bdef\s+[a-zA-Z_]\w*\s*\(",
+            r"\bclass\s+[A-Z]\w*",
+            r"\bimport\s+[a-zA-Z_]",
+            r"\bfrom\s+[a-zA-Z_].*import",
+            r"\bfor\s+\w+\s+in\s+",
+            r"\bwhile\s*\(?.*\)?\s*:",
+            r"\bif\s+.*:\s*$",
+            r"\bfunction\s+[a-zA-Z_]\w*\s*\(",
+            r"\bconst\s+[a-zA-Z_]\w*\s*=",
+            r"\bvar\s+[a-zA-Z_]\w*\s*=",
+            r"\blet\s+[a-zA-Z_]\w*\s*=",
+            r"\breturn\s+[^\n;]+[;]?",
+            r"^\s*[a-zA-Z_]\w*\s*\([^\)]*\)\s*$",  # function calls
+        ]
+        code_matches = sum(1 for line in lines if any(re.search(m, line) for m in code_syntax_markers))
+        if code_matches >= 2 or (len(lines) <= 4 and code_matches >= 1):
+            return "code"
+
+        # 2. Table check (presence of '|' or multiple columnar aligned columns)
+        table_lines = sum(1 for l in lines if "|" in l or len(re.findall(r"\s{3,}", l)) >= 2)
+        if table_lines >= max(len(lines) // 2, 2):
+            return "table"
+
+        # 3. Procedural steps check ("Step 1:", "Step 2", "Phase 1:")
+        step_lines = sum(1 for l in lines if re.match(r"^(?:step|phase|stage|task)\s+\d+[\:\.\-]?\s+", l, re.IGNORECASE))
+        if step_lines >= 2:
+            return "procedure"
+
+        # 4. Key-Value / Structured Data check ("Key: Value", "Marks: 95", "Date: 2024-01-01")
+        kv_lines = sum(1 for l in lines if re.match(r"^[A-Z][A-Za-z0-9_\s]{1,25}\s*:\s*[^\n]+$", l))
+        if kv_lines >= max(len(lines) // 2, 2):
+            return "key_value"
+
+        # 5. List check (numbered lines or bullet points)
+        list_lines = sum(1 for l in lines if re.match(r"^(?:\d+[\.\)]|[-*•])\s+", l))
+        if list_lines >= max(len(lines) // 2, 2):
+            return "list"
+
+        return "text"
+
     def split_documents(self, documents: List[Document]) -> List[Chunk]:
         """
-        Split a list of loaded documents into chunks with stable IDs and section metadata.
+        Split loaded documents into structure-aware chunks with stable IDs,
+        content types, and relational metadata.
         """
         all_chunks: List[Chunk] = []
         chunk_counter = 0
@@ -123,8 +185,6 @@ class DocumentChunker:
         for doc in documents:
             doc_id = str(doc.metadata.get("doc_id", "doc"))
             page_num = doc.metadata.get("page_number", 1)
-            source = str(doc.metadata.get("source", ""))
-            filename = str(doc.metadata.get("filename", ""))
 
             sections = self._split_into_sections(doc.page_content)
 
@@ -135,7 +195,9 @@ class DocumentChunker:
                 if not sec_content:
                     continue
 
-                # If the section comfortably fits in chunk_size, keep it intact
+                content_type = self._detect_content_type(sec_content)
+
+                # Keep cohesive sections, tables, and lists intact if they fit
                 if len(sec_content) <= self.chunk_size:
                     chunk_id = f"{doc_id}_c{chunk_counter}"
                     chunk_meta = {
@@ -143,6 +205,7 @@ class DocumentChunker:
                         "chunk_id": chunk_id,
                         "chunk_index": chunk_counter,
                         "section": sec_name,
+                        "content_type": content_type,
                         "char_count": len(sec_content),
                     }
                     all_chunks.append(Chunk(text=sec_content, metadata=chunk_meta))
@@ -157,6 +220,7 @@ class DocumentChunker:
                             "chunk_id": chunk_id,
                             "chunk_index": chunk_counter,
                             "section": f"{sec_name} (Part {sub_idx + 1})" if len(sub_texts) > 1 else sec_name,
+                            "content_type": self._detect_content_type(sub_text),
                             "char_count": len(sub_text),
                         }
                         all_chunks.append(Chunk(text=sub_text, metadata=chunk_meta))

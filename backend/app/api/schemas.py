@@ -4,12 +4,47 @@ Provides request and response validation for chat, documents, and ingestion endp
 """
 
 from typing import Any, Dict, List, Optional
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class HealthResponse(BaseModel):
     """Health check response."""
     status: str = Field(default="ok", description="Service health status")
+
+
+class ChatSessionResponse(BaseModel):
+    """Metadata representation for a chat session."""
+    id: str = Field(..., description="Unique chat identifier")
+    title: str = Field(..., description="Chat session title")
+    created_at: str = Field(..., description="Creation timestamp in UTC ISO-8601")
+    updated_at: str = Field(..., description="Last updated timestamp in UTC ISO-8601")
+
+
+class ChatCreateRequest(BaseModel):
+    """Request payload to create a new chat."""
+    title: Optional[str] = Field(default=None, max_length=200, description="Optional chat title")
+
+    @field_validator("title")
+    @classmethod
+    def sanitize_title(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None:
+            v = v.strip()
+            if not v:
+                return None
+        return v
+
+
+class ChatRenameRequest(BaseModel):
+    """Request payload to rename an existing chat."""
+    title: str = Field(..., min_length=1, max_length=200, description="New chat title")
+
+    @field_validator("title")
+    @classmethod
+    def validate_title(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("Chat title cannot be blank or whitespace-only.")
+        return v
 
 
 class SourceChunk(BaseModel):
@@ -64,3 +99,35 @@ class ReindexResponse(BaseModel):
     documents_processed: int = Field(..., description="Number of documents reindexed")
     chunks_stored: int = Field(..., description="Total chunks indexed in fresh collection")
     message: str = Field(..., description="Human-readable result summary")
+
+
+class DocumentRecordResponse(BaseModel):
+    """Metadata record for a registered or attached document in SQLite."""
+    id: str = Field(..., description="Unique document ID")
+    filename: str = Field(..., description="Original PDF filename")
+    file_hash: str = Field(..., description="SHA-256 content hash")
+    file_size: int = Field(..., description="Size in bytes")
+    page_count: Optional[int] = Field(None, description="Number of pages")
+    chunk_count: Optional[int] = Field(None, description="Number of chunks")
+    storage_path: Optional[str] = Field(None, description="Relative or safe storage path")
+    status: str = Field(..., description="Processing status: pending, processing, ready, failed")
+    error_message: Optional[str] = Field(None, description="Safe error message on failure")
+    created_at: str = Field(..., description="Creation timestamp in UTC ISO-8601")
+    attached_at: Optional[str] = Field(None, description="Timestamp when attached to chat")
+
+
+class DocumentUploadResponse(BaseModel):
+    """Response payload after uploading a document to a chat."""
+    message: str = Field(..., description="Status summary message")
+    document: DocumentRecordResponse = Field(..., description="Attached document details")
+
+
+class ChatMessageResponse(BaseModel):
+    """Persisted chat message with sources."""
+    id: str = Field(..., description="Unique message ID")
+    chat_id: str = Field(..., description="Parent chat ID")
+    role: str = Field(..., description="Message role: user or assistant")
+    content: str = Field(..., description="Message text content")
+    sources: List[SourceChunk] = Field(default_factory=list, description="Source provenance chunks for assistant responses")
+    created_at: str = Field(..., description="Message creation timestamp in UTC ISO-8601")
+

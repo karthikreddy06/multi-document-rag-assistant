@@ -12,9 +12,7 @@ def test_format_context():
         RetrievedChunk(text="Document content details", metadata={"filename": "sample_doc.pdf", "page_number": 3, "section": "OVERVIEW"}),
     ]
     formatted = format_context(chunks)
-    assert "Context Block 1" in formatted
-    assert "Document: sample_doc.pdf" in formatted
-    assert "Page: 2" in formatted
+    assert "DOCUMENT 1: sample_doc.pdf" in formatted
     assert "TECHNICAL SKILLS" in formatted
     assert "Document content details" in formatted
 
@@ -27,9 +25,7 @@ def test_build_rag_prompt_rules():
 
     # Verify critical generic guardrail rules
     assert "STRICT GROUNDING" in prompt
-    assert "COMPLETENESS & DETAIL" in prompt
-    assert "MULTI-DOCUMENT COMPARISONS" in prompt
-    assert "PARTIAL CONTEXT" in prompt
+    assert "MULTI-DOCUMENT ANSWERS" in prompt
+    assert "IMAGE HANDLING" in prompt
     assert "ACCURACY & TERMINOLOGY" in prompt
-    assert "CLARITY" in prompt
     assert "Question: What are the skills?" in prompt

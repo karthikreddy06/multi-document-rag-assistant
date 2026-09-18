@@ -1,5 +1,7 @@
 :root {
   /* Warm Terracotta / Cream Palette */
+  --color-primary: #A24F3D;
+  --color-primary-hover: #8E3E2E;
   --color-primary-dark: #A24F3D;
   --color-terracotta: #C97D63;
   --color-light-peach: #E8B59E;

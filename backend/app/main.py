@@ -71,7 +71,14 @@ class RAGApplication:
         if not question or not question.strip():
             return "Please provide a non-empty question."
 
-        chunks = self.retriever.retrieve(question)
+        if hasattr(self.retriever, "retrieve_adaptive"):
+            chunks, plan, _ = self.retriever.retrieve_adaptive(question)
+            budget = getattr(plan, "generation_budget", None)
+            num_pred = getattr(budget, "num_predict", None)
+            num_ctx = getattr(budget, "num_ctx", None)
+        else:
+            chunks = self.retriever.retrieve(question)
+            plan, num_pred, num_ctx = None, None, None
 
         if show_context and chunks:
             print("\n--- Retrieved Context Chunks ---")
@@ -80,7 +87,13 @@ class RAGApplication:
                 print(f"{chunk.text[:200]}...\n")
             print("--- End Context ---\n")
 
-        answer = self.generator.generate_answer(question, chunks)
+        answer = self.generator.generate_answer(
+            question=question,
+            chunks=chunks,
+            plan=plan,
+            num_predict=num_pred,
+            num_ctx=num_ctx,
+        )
         return answer
 
     def interactive_loop(self) -> None:

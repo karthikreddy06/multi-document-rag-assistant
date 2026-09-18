@@ -247,22 +247,38 @@ python -m app.main --reindex
 
 ## Running the Application
 
-### Interactive Chat Session
-Run the interactive CLI interface:
+### 1. Start FastAPI Backend Server
+From the project root:
 ```powershell
+cd backend
+python -m uvicorn app.api.routes:app --host 127.0.0.1 --port 8000
+```
+- API Base URL: `http://127.0.0.1:8000`
+- OpenAPI Swagger UI: `http://127.0.0.1:8000/docs`
+- Health Endpoint: `http://127.0.0.1:8000/api/health`
+
+### 2. Start Vite React Frontend UI
+From a separate terminal window in the project root:
+```powershell
+cd frontend
+npm install
+npm run dev
+```
+- Web Application URL: `http://localhost:5173`
+
+### 3. CLI Interactive Session (Optional)
+Run the interactive CLI interface directly:
+```powershell
+cd backend
 python -m app.main
 ```
 Type your question at the prompt and press Enter. Type `exit` or `quit` to end the session.
 
-### One-Shot Query Execution
+### 4. One-Shot Query Execution (CLI)
 Execute a single query directly from the command line:
 ```powershell
-python -m app.main --query "What is the primary methodology described in the document?"
-```
-
-To display retrieved context chunks alongside the final answer:
-```powershell
-python -m app.main --query "What is the main topic of the sample document?" --show-context
+cd backend
+python -m app.main --query "What is the primary methodology described in the document?" --show-context
 ```
 
 ---

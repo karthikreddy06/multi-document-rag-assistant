@@ -20,8 +20,10 @@ class Settings(BaseSettings):
     # Ollama settings
     ollama_host: str = Field(default="http://localhost:11434", alias="OLLAMA_HOST")
     embedding_model: str = Field(default="nomic-embed-text", alias="EMBEDDING_MODEL")
-    llm_model: str = Field(default="llama3.2", alias="LLM_MODEL")
-    ollama_timeout: float = Field(default=60.0, alias="OLLAMA_TIMEOUT")
+    llm_model: str = Field(default="llama3.2:1b", alias="LLM_MODEL")
+    ollama_timeout: float = Field(default=180.0, alias="OLLAMA_TIMEOUT")
+    llm_num_predict: int = Field(default=120, alias="LLM_NUM_PREDICT")
+    llm_num_ctx: int = Field(default=1536, alias="LLM_NUM_CTX")
 
     # Storage settings - defaults relative to project structure
     # chroma_db is at project root, documents is in backend/
@@ -29,12 +31,16 @@ class Settings(BaseSettings):
     collection_name: str = Field(default="documents", alias="COLLECTION_NAME")
     documents_dir: str = Field(default=str(_BACKEND_DIR / "documents"), alias="DOCUMENTS_DIR")
 
+    # Database settings
+    database_path: str = Field(default=str(_BACKEND_DIR / "data" / "rag_app.db"), alias="DATABASE_PATH")
+    upload_dir: str = Field(default=str(_BACKEND_DIR / "data" / "uploads"), alias="UPLOAD_DIR")
+
     # Chunking settings
     chunk_size: int = Field(default=800, alias="CHUNK_SIZE")
     chunk_overlap: int = Field(default=100, alias="CHUNK_OVERLAP")
 
     # Retrieval settings
-    top_k: int = Field(default=5, alias="TOP_K")
+    top_k: int = Field(default=3, alias="TOP_K")
 
     # API & CORS settings
     cors_origins: List[str] = Field(
@@ -63,6 +69,14 @@ class Settings(BaseSettings):
     @property
     def documents_abs_path(self) -> Path:
         return Path(self.documents_dir).resolve()
+
+    @property
+    def database_abs_path(self) -> Path:
+        return Path(self.database_path).resolve()
+
+    @property
+    def upload_abs_path(self) -> Path:
+        return Path(self.upload_dir).resolve()
 
 
 settings = Settings()

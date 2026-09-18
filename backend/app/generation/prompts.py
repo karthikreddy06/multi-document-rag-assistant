@@ -4,44 +4,67 @@ Constructs strict, hallucination-resistant prompts for multi-document RAG,
 enforcing grounding constraints and refusal of unsupported questions.
 """
 
-from typing import List
+from typing import List, Optional
 from app.models import RetrievedChunk
 
 
-SYSTEM_INSTRUCTIONS = """You are an accurate, benign multi-document RAG assistant analyzing user-uploaded documents (such as project reports, technical documentation, and literary works).
+SYSTEM_INSTRUCTIONS = """You are an accurate assistant analyzing user-uploaded documents.
 
 Follow these operational guidelines:
-1. STRICT GROUNDING: Base your answer strictly on the provided context. If information is not in the context, state that it is not available.
-2. COMPLETENESS & DETAIL: When answering what was used, implemented, built, or described, carefully read all bullet points and sentences. If multiple items, tools, libraries, or methods are mentioned (especially paired or conjoined items like 'A and B'), list ALL of them. Do not omit any item mentioned in the text.
-3. MULTI-DOCUMENT COMPARISONS: When comparing entities across documents, use the provided context from each document to present a clear, grounded comparison highlighting similarities and differences.
-4. PARTIAL CONTEXT: If some parts of a question are supported by the context but other parts are missing, answer the supported parts completely and explicitly note which specific parts are not available.
-5. ACCURACY & TERMINOLOGY: Preserve exact names, numbers, dates, and terminology as written in the source documents.
-6. CLARITY: Present your answer clearly and concisely without mentioning internal retrieval mechanics or chunk IDs."""
+- STRICT GROUNDING: Base your answer strictly on the facts, details, numbers, and code present in the provided context.
+- MULTI-DOCUMENT ANSWERS: When asked to explain or summarize "each file", "all files", or "these documents", produce exactly ONE section per distinct DOCUMENT provided in the context (approx. 3 concise lines per document). Never list multiple context blocks from the same file as separate documents.
+- IMAGE HANDLING: If an image file has no OCR text or visual description available, state clearly that visual understanding is unavailable and no text was extracted via OCR. Do not fabricate visual descriptions or recite technical metadata dimensions.
+- CODE & SCRIPT FIDELITY: When the user asks for code or an implementation, provide the code statements from the context inside a markdown code block (```python ... ```).
+- MISSING INFORMATION: If requested information is absent, state clearly that it is not available in the provided document.
+- ACCURACY & TERMINOLOGY: Preserve exact numbers, dates, terms, and values from the source."""
 
 
 def format_context(chunks: List[RetrievedChunk]) -> str:
-    """Format retrieved chunks into a clear, labeled context block with document, page, and section."""
+    """Format retrieved chunks into structured evidence grouped by distinct document, deduplicating repeated lines."""
     if not chunks:
         return "No relevant context found."
 
-    formatted_blocks = []
-    for i, chunk in enumerate(chunks, 1):
-        section_label = chunk.section
-        source_label = chunk.metadata.get("filename", chunk.metadata.get("source_file", "document"))
-        page_label = chunk.metadata.get("page_number", chunk.metadata.get("page", 1))
-        formatted_blocks.append(
-            f"--- Context Block {i} [Document: {source_label} | Page: {page_label} | Section: {section_label}] ---\n"
-            f"{chunk.text.strip()}"
-        )
+    # Group chunks by filename/document
+    docs_map = {}
+    for chunk in chunks:
+        fn = str(chunk.metadata.get("filename", chunk.metadata.get("source_file", "document")))
+        if fn not in docs_map:
+            docs_map[fn] = []
+        docs_map[fn].append(chunk)
 
-    return "\n\n".join(formatted_blocks)
+    formatted_docs = []
+    for doc_idx, (fn, doc_chunks) in enumerate(docs_map.items(), 1):
+        fmt = doc_chunks[0].metadata.get("format", "unknown")
+        lines = [f"DOCUMENT {doc_idx}: {fn} (File Type: {fmt.upper()})", "Evidence:"]
+        seen_lines = set()
+        for c in doc_chunks:
+            page = c.metadata.get("page_number", 1)
+            sec = c.metadata.get("section", "General")
+            c_lines = []
+            for raw_line in c.text.splitlines():
+                stripped = raw_line.strip()
+                if not stripped:
+                    continue
+                norm = stripped.lower()
+                if norm not in seen_lines:
+                    seen_lines.add(norm)
+                    c_lines.append(stripped)
+            if c_lines:
+                lines.append(f"--- [Page/Slide/Sheet {page} | Section: {sec}] ---\n" + "\n".join(c_lines))
+        formatted_docs.append("\n".join(lines))
+
+    return "\n\n" + ("=" * 40) + "\n\n".join(formatted_docs) + "\n" + ("=" * 40)
 
 
-def build_rag_prompt(question: str, chunks: List[RetrievedChunk]) -> str:
+def build_rag_prompt(question: str, chunks: List[RetrievedChunk], lines_per_doc: Optional[int] = None) -> str:
     """Construct the final prompt for the LLM."""
     context_str = format_context(chunks)
 
-    prompt = f"""{SYSTEM_INSTRUCTIONS}
+    length_rule = ""
+    if lines_per_doc and lines_per_doc > 0:
+        length_rule = f"\n- EXACT LENGTH RULE: Provide EXACTLY {lines_per_doc} concise bullet lines for EACH distinct DOCUMENT (no more, no less). Do not exceed {lines_per_doc} lines per document.\n"
+
+    prompt = f"""{SYSTEM_INSTRUCTIONS}{length_rule}
 
 --- PROVIDED CONTEXT START ---
 {context_str}
