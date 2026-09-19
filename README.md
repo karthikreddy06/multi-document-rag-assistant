@@ -283,6 +283,53 @@ python -m app.main --query "What is the primary methodology described in the doc
 
 ---
 
+## Deployment
+
+### 1. Deployment Architecture Overview
+- **Frontend**: Vite React SPA hosted as a static site (e.g., Vercel, Netlify, Cloudflare Pages, or Render Static Site).
+- **Backend**: FastAPI Python application deployed as a container or web service (e.g., Docker, Render Web Service, Railway, or VPS).
+- **LLM / Embedding Service**: Remote Ollama instance (or tunnel/cloud VM instance with GPU/RAM) accessible via `OLLAMA_HOST`.
+
+### 2. Required Environment Variables
+
+#### Backend (`backend/.env`)
+| Variable | Description | Example / Default |
+|---|---|---|
+| `OLLAMA_HOST` | URL of the running Ollama instance | `http://localhost:11434` or remote URL |
+| `EMBEDDING_MODEL` | Ollama model used for dense vector embeddings | `nomic-embed-text` |
+| `LLM_MODEL` | Ollama model used for grounded answer generation | `llama3.2` |
+| `OLLAMA_TIMEOUT` | Timeout in seconds for Ollama requests | `180.0` |
+| `CHROMA_PATH` | Directory for persistent ChromaDB storage | `./chroma_db` |
+| `DATABASE_PATH` | Path to SQLite database file | `./data/rag_app.db` |
+| `UPLOAD_DIR` | Directory where uploaded files are stored | `./data/uploads` |
+| `CORS_ORIGINS` | JSON list or comma-separated origins allowed for CORS | `["https://your-frontend.vercel.app"]` |
+| `PORT` | HTTP port for FastAPI/Uvicorn | `8000` |
+
+#### Frontend (`frontend/.env`)
+| Variable | Description | Example |
+|---|---|---|
+| `VITE_API_URL` | Public backend URL accessible from browser | `https://your-backend.onrender.com` |
+
+### 3. Production Backend Container Deployment (Docker)
+Build and run the backend Docker container:
+```bash
+docker build -t rag-backend ./backend
+docker run -d -p 8000:8000 \
+  -e OLLAMA_HOST="http://host.docker.internal:11434" \
+  -e CORS_ORIGINS='["https://your-frontend.vercel.app"]' \
+  rag-backend
+```
+
+### 4. Ollama & Model Hosting Requirements
+- Ollama requires minimum 4GB RAM (8GB+ recommended) and CPU/GPU resources to load `llama3.2` and `nomic-embed-text`.
+- Standard free-tier serverless hostings (512MB RAM) cannot execute Ollama directly inside the backend container. Ollama must run on a cloud VM, GPU instance, or dedicated server with `OLLAMA_HOST` configured to point to it.
+
+### 5. Persistent Storage & Cloud Limitations
+- SQLite database (`rag_app.db`), upload files (`/data/uploads`), and ChromaDB (`/chroma_db`) are stored on the filesystem.
+- On ephemeral container platforms (e.g. basic Render/Vercel free instances), attach persistent volume storage to `/app/data` and `/app/chroma_db` to retain chats, uploaded PDFs, and vector embeddings across container restarts.
+
+---
+
 ## Testing
 
 The test suite is partitioned using pytest markers to separate fast unit/retrieval verification from slower local LLM generation tests.

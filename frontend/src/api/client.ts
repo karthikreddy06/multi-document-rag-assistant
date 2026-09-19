@@ -46,11 +46,14 @@ export interface DocumentUploadResponse {
 
 export interface Source {
   filename: string;
-  page: number | null;
-  section: string | null;
-  chunk_id: string | null;
-  score: number | null;
-  text: string | null;
+  page?: number | null;
+  slide?: number | null;
+  sheet?: number | null;
+  section?: string | null;
+  chunk_id?: string | null;
+  chunk_index?: number | null;
+  score?: number | null;
+  text?: string | null;
 }
 
 export interface ChatResponse {

@@ -5,9 +5,9 @@ Loads settings from environment variables or .env file with sensible production 
 
 import os
 from pathlib import Path
-from typing import List
+from typing import Any, List
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from pydantic import Field
+from pydantic import Field, field_validator
 
 
 # Project root is the parent of the backend directory (where this config.py's grandparent is)
@@ -52,6 +52,20 @@ class Settings(BaseSettings):
         ],
         alias="CORS_ORIGINS"
     )
+
+    @field_validator("cors_origins", mode="before")
+    @classmethod
+    def parse_cors_origins(cls, v: Any) -> Any:
+        if isinstance(v, str):
+            v_str = v.strip()
+            if v_str.startswith("[") and v_str.endswith("]"):
+                import json
+                try:
+                    return json.loads(v_str)
+                except Exception:
+                    pass
+            return [origin.strip() for origin in v_str.split(",") if origin.strip()]
+        return v
 
     # Logging settings
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
