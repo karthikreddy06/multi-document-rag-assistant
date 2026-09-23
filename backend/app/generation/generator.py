@@ -6,6 +6,7 @@ Interacts with Ollama (llama3.2) to synthesize accurate, grounded answers from r
 import re
 import time
 from typing import Any, Iterator, List, Optional
+import httpx
 import ollama
 
 from app.config import settings
@@ -17,7 +18,7 @@ logger = setup_logger("generation.generator")
 
 
 class LLMGenerator:
-    """Production LLM response generator utilizing Ollama llama3.2."""
+    """Production LLM response generator utilizing Ollama or Cloud AI API."""
 
     CONTRADICTION_PATTERN = re.compile(
         r"^(?:"
@@ -111,14 +112,24 @@ class LLMGenerator:
         timeout: Optional[float] = None,
         num_predict: Optional[int] = None,
         num_ctx: Optional[int] = None,
+        provider: Optional[str] = None,
+        api_url: Optional[str] = None,
+        api_key: Optional[str] = None,
     ):
+        self.provider = (provider or settings.llm_provider).lower()
         self.model = model or settings.llm_model
         self.host = host or settings.ollama_host
         self.temperature = temperature
         self.timeout = timeout or settings.ollama_timeout
         self.num_predict = num_predict if num_predict is not None else settings.llm_num_predict
         self.num_ctx = num_ctx if num_ctx is not None else settings.llm_num_ctx
-        self.client = ollama.Client(host=self.host, timeout=self.timeout)
+        self.api_url = api_url or settings.llm_api_url
+        self.api_key = api_key or settings.llm_api_key
+
+        if self.provider == "ollama":
+            self.client = ollama.Client(host=self.host, timeout=self.timeout)
+        else:
+            self.client = None
 
     def _get_generation_options(
         self,
@@ -132,6 +143,87 @@ class LLMGenerator:
             "num_ctx": num_ctx if num_ctx is not None else self.num_ctx,
             "stop": ["<|eot_id|>", "<|start_header_id|>", "\n\nQuestion:"],
         }
+
+    def _cloud_generate(self, prompt: str, num_predict: Optional[int] = None) -> str:
+        """Execute non-streaming completion call to OpenAI-compatible cloud REST endpoint using httpx."""
+        url = self.api_url.rstrip("/")
+        if not url.endswith("/chat/completions") and not url.endswith("/completions"):
+            url = f"{url}/chat/completions"
+
+        headers = {
+            "Content-Type": "application/json",
+        }
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+
+        max_tokens = num_predict if num_predict is not None else self.num_predict
+        payload = {
+            "model": self.model,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": self.temperature,
+            "max_tokens": max_tokens,
+        }
+
+        with httpx.Client(timeout=self.timeout) as http_client:
+            resp = http_client.post(url, headers=headers, json=payload)
+            resp.raise_for_status()
+            data = resp.json()
+
+        choices = data.get("choices", [])
+        if not choices:
+            return ""
+        choice = choices[0]
+        if "message" in choice:
+            return choice["message"].get("content", "").strip()
+        elif "text" in choice:
+            return choice["text"].strip()
+        return ""
+
+    def _cloud_generate_stream(self, prompt: str, num_predict: Optional[int] = None) -> Iterator[str]:
+        """Execute streaming completion call to OpenAI-compatible cloud REST endpoint using httpx."""
+        import json
+        url = self.api_url.rstrip("/")
+        if not url.endswith("/chat/completions") and not url.endswith("/completions"):
+            url = f"{url}/chat/completions"
+
+        headers = {
+            "Content-Type": "application/json",
+        }
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+
+        max_tokens = num_predict if num_predict is not None else self.num_predict
+        payload = {
+            "model": self.model,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": self.temperature,
+            "max_tokens": max_tokens,
+            "stream": True,
+        }
+
+        with httpx.Client(timeout=self.timeout) as http_client:
+            with http_client.stream("POST", url, headers=headers, json=payload) as response:
+                response.raise_for_status()
+                for line in response.iter_lines():
+                    if not line:
+                        continue
+                    line_str = line.strip()
+                    if line_str.startswith("data: "):
+                        data_part = line_str[6:].strip()
+                        if data_part == "[DONE]":
+                            break
+                        try:
+                            parsed = json.loads(data_part)
+                            choices = parsed.get("choices", [])
+                            if choices:
+                                delta = choices[0].get("delta", {})
+                                token = delta.get("content", "")
+                                if not token and "text" in choices[0]:
+                                    token = choices[0]["text"]
+                                if token:
+                                    yield token
+                        except Exception:
+                            continue
 
     def generate_answer(
         self,
@@ -240,17 +332,21 @@ class LLMGenerator:
         prompt = build_rag_prompt(effective_question, chunks, lines_per_doc=lines_per_doc)
         pred = num_predict if num_predict is not None else self.num_predict
         ctx = num_ctx if num_ctx is not None else self.num_ctx
-        logger.info(f"Generating answer using {self.model} with {len(chunks)} context chunks (num_predict={pred}, num_ctx={ctx})...")
+        logger.info(f"Generating answer using {self.model} ({self.provider}) with {len(chunks)} context chunks (num_predict={pred}, num_ctx={ctx})...")
 
         last_error = None
         for attempt in range(1, max_retries + 1):
             try:
-                response = self.client.generate(
-                    model=self.model,
-                    prompt=prompt,
-                    options=self._get_generation_options(num_predict=num_predict, num_ctx=num_ctx),
-                )
-                answer = response.get("response", "").strip()
+                if self.provider == "ollama":
+                    response = self.client.generate(
+                        model=self.model,
+                        prompt=prompt,
+                        options=self._get_generation_options(num_predict=num_predict, num_ctx=num_ctx),
+                    )
+                    answer = response.get("response", "").strip()
+                else:
+                    answer = self._cloud_generate(prompt, num_predict=num_predict)
+
                 cleaned_ans = self.clean_contradictory_preambles(answer)
                 if lines_per_doc:
                     cleaned_ans = self.enforce_exact_line_count(cleaned_ans, lines_per_doc)
@@ -258,16 +354,15 @@ class LLMGenerator:
             except Exception as e:
                 last_error = e
                 logger.warning(
-                    f"LLM generation attempt {attempt}/{max_retries} failed for {self.model}: {e}. "
+                    f"LLM generation attempt {attempt}/{max_retries} failed for {self.model} ({self.provider}): {e}. "
                     f"{'Retrying...' if attempt < max_retries else 'No more retries.'}"
                 )
                 if attempt < max_retries:
                     time.sleep(0.5 * attempt)
 
-        logger.error(f"Error during LLM generation with {self.model} after {max_retries} attempts: {last_error}")
+        logger.error(f"Error during LLM generation with {self.model} ({self.provider}) after {max_retries} attempts: {last_error}")
         raise RuntimeError(
-            f"LLM generation failed: {last_error}. Verify Ollama is running at {self.host} "
-            f"and model '{self.model}' is installed."
+            f"LLM generation failed ({self.provider}): {last_error}."
         ) from last_error
 
     def generate_answer_stream(
@@ -382,19 +477,22 @@ class LLMGenerator:
         prompt = build_rag_prompt(effective_question, chunks, lines_per_doc=lines_per_doc)
         pred = num_predict if num_predict is not None else self.num_predict
         ctx = num_ctx if num_ctx is not None else self.num_ctx
-        logger.info(f"Streaming answer using {self.model} with {len(chunks)} context chunks (num_predict={pred}, num_ctx={ctx})...")
+        logger.info(f"Streaming answer using {self.model} ({self.provider}) with {len(chunks)} context chunks (num_predict={pred}, num_ctx={ctx})...")
 
         def raw_token_stream():
-            stream = self.client.generate(
-                model=self.model,
-                prompt=prompt,
-                stream=True,
-                options=self._get_generation_options(num_predict=num_predict, num_ctx=num_ctx),
-            )
-            for chunk in stream:
-                token = chunk.get("response", "")
-                if token:
-                    yield token
+            if self.provider == "ollama":
+                stream = self.client.generate(
+                    model=self.model,
+                    prompt=prompt,
+                    stream=True,
+                    options=self._get_generation_options(num_predict=num_predict, num_ctx=num_ctx),
+                )
+                for chunk in stream:
+                    token = chunk.get("response", "")
+                    if token:
+                        yield token
+            else:
+                yield from self._cloud_generate_stream(prompt, num_predict=num_predict)
 
         yield from self.filter_stream_tokens(raw_token_stream())
 

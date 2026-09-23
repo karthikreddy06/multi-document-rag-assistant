@@ -42,12 +42,15 @@ class RAGApplication:
             self.auto_ingest()
 
     def check_prerequisites(self) -> bool:
-        """Check database and Ollama availability."""
+        """Check database and AI service provider availability."""
         if not self.embedding_service.check_health():
-            print("\n[WARNING] Could not verify Ollama connection or required models.")
-            print("Ensure Ollama is running ('ollama serve') and models are pulled:\n")
-            print(f"  ollama pull {settings.embedding_model}")
-            print(f"  ollama pull {settings.llm_model}\n")
+            if self.embedding_service.provider == "ollama":
+                print("\n[WARNING] Could not verify Ollama connection or required models.")
+                print("Ensure Ollama is running ('ollama serve') and models are pulled:\n")
+                print(f"  ollama pull {settings.embedding_model}")
+                print(f"  ollama pull {settings.llm_model}\n")
+            else:
+                print(f"\n[WARNING] Could not verify cloud embedding service at {settings.embedding_api_url}.")
             return False
         return True
 
@@ -84,7 +87,8 @@ class RAGApplication:
             print("\n--- Retrieved Context Chunks ---")
             for i, chunk in enumerate(chunks, 1):
                 print(f"[{i}] Section: {chunk.section} (Score: {chunk.score:.3f})")
-                print(f"{chunk.text[:200]}...\n")
+                snippet = chunk.text[:200].encode(sys.stdout.encoding or 'utf-8', errors='replace').decode(sys.stdout.encoding or 'utf-8')
+                print(f"{snippet}...\n")
             print("--- End Context ---\n")
 
         answer = self.generator.generate_answer(

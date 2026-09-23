@@ -17,13 +17,21 @@ _BACKEND_DIR = Path(__file__).resolve().parent.parent
 
 
 class Settings(BaseSettings):
-    # Ollama settings
-    ollama_host: str = Field(default="http://localhost:11434", alias="OLLAMA_HOST")
-    embedding_model: str = Field(default="nomic-embed-text", alias="EMBEDDING_MODEL")
+    # Provider & Model settings
+    llm_provider: str = Field(default="ollama", alias="LLM_PROVIDER")
     llm_model: str = Field(default="llama3.2:1b", alias="LLM_MODEL")
-    ollama_timeout: float = Field(default=180.0, alias="OLLAMA_TIMEOUT")
+    llm_api_url: str = Field(default="", alias="LLM_API_URL")
+    llm_api_key: str = Field(default="", alias="LLM_API_KEY")
     llm_num_predict: int = Field(default=120, alias="LLM_NUM_PREDICT")
     llm_num_ctx: int = Field(default=1536, alias="LLM_NUM_CTX")
+
+    embedding_provider: str = Field(default="ollama", alias="EMBEDDING_PROVIDER")
+    embedding_model: str = Field(default="nomic-embed-text", alias="EMBEDDING_MODEL")
+    embedding_api_url: str = Field(default="", alias="EMBEDDING_API_URL")
+    embedding_api_key: str = Field(default="", alias="EMBEDDING_API_KEY")
+
+    ollama_host: str = Field(default="http://localhost:11434", alias="OLLAMA_HOST")
+    ollama_timeout: float = Field(default=180.0, alias="OLLAMA_TIMEOUT")
 
     # Storage settings - defaults relative to project structure
     # chroma_db is at project root, documents is in backend/

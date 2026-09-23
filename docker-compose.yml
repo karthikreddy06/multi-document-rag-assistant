@@ -1,0 +1,68 @@
+services:
+  # 1. Ollama LLM & Embedding Service
+  ollama:
+    image: ollama/ollama:latest
+    container_name: rag_ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_storage:/root/.ollama
+    restart: unless-stopped
+
+  # 2. Ollama Model Puller Init Container
+  ollama-pull-models:
+    image: curlimages/curl:latest
+    container_name: rag_ollama_pull
+    depends_on:
+      - ollama
+    entrypoint: /bin/sh
+    command: >
+      -c " echo 'Waiting for Ollama service to start...'; while ! curl -s http://ollama:11434/api/tags > /dev/null; do sleep 2; done; echo 'Pulling nomic-embed-text embedding model...'; curl -s -X POST http://ollama:11434/api/pull -d '{\"name\": \"nomic-embed-text\"}' > /dev/null; echo 'Pulling llama3.2:1b generation model...'; curl -s -X POST http://ollama:11434/api/pull -d '{\"name\": \"llama3.2:1b\"}' > /dev/null; echo 'Ollama models successfully downloaded!'; "
+
+  # 3. FastAPI Backend Application with embedded ChromaDB & SQLite
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: rag_backend
+    ports:
+      - "8001:8000"
+    environment:
+      - LLM_PROVIDER=ollama
+      - LLM_MODEL=llama3.2:1b
+      - OLLAMA_HOST=http://ollama:11434
+      - OLLAMA_TIMEOUT=180.0
+      - EMBEDDING_PROVIDER=ollama
+      - EMBEDDING_MODEL=nomic-embed-text
+      - CHROMA_PATH=/app/chroma_db
+      - DATABASE_PATH=/app/data/rag_app.db
+      - UPLOAD_DIR=/app/data/uploads
+      - DOCUMENTS_DIR=/app/documents
+      - CORS_ORIGINS=["http://localhost:3000","http://localhost:80","http://127.0.0.1:3000","http://127.0.0.1:80"]
+    volumes:
+      - chroma_data:/app/chroma_db
+      - backend_data:/app/data
+      - ./backend/documents:/app/documents:ro
+    depends_on:
+      - ollama
+    restart: unless-stopped
+
+  # 4. Vite React Frontend SPA (Nginx)
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        - VITE_API_URL=http://localhost:8000
+    container_name: rag_frontend
+    ports:
+      - "3000:80"
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+volumes:
+  ollama_storage:
+  chroma_data:
+  backend_data:
+  backend_documents:

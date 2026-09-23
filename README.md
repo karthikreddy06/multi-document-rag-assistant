@@ -285,19 +285,32 @@ python -m app.main --query "What is the primary methodology described in the doc
 
 ## Deployment
 
+### Environment Modes
+
+- **LOCAL DEVELOPMENT** → Ollama + local models (`llama3.2:1b`, `nomic-embed-text`)
+- **PRODUCTION** → Cloud AI provider (e.g. Groq / OpenRouter / Gemini) + deployed FastAPI backend
+
 ### 1. Deployment Architecture Overview
 - **Frontend**: Vite React SPA hosted as a static site (e.g., Vercel, Netlify, Cloudflare Pages, or Render Static Site).
-- **Backend**: FastAPI Python application deployed as a container or web service (e.g., Docker, Render Web Service, Railway, or VPS).
-- **LLM / Embedding Service**: Remote Ollama instance (or tunnel/cloud VM instance with GPU/RAM) accessible via `OLLAMA_HOST`.
+- **Backend**: FastAPI Python application deployed as a web service (e.g., Render Web Service, Railway, Docker container, or VPS).
+- **LLM / Embedding Service**:
+  - *Local Mode*: Ollama running locally at `http://localhost:11434`.
+  - *Production Mode*: Configurable cloud AI provider API (e.g. Groq, OpenRouter, Google Gemini) via `LLM_PROVIDER=cloud` and `EMBEDDING_PROVIDER=cloud`.
 
 ### 2. Required Environment Variables
 
 #### Backend (`backend/.env`)
 | Variable | Description | Example / Default |
 |---|---|---|
-| `OLLAMA_HOST` | URL of the running Ollama instance | `http://localhost:11434` or remote URL |
-| `EMBEDDING_MODEL` | Ollama model used for dense vector embeddings | `nomic-embed-text` |
-| `LLM_MODEL` | Ollama model used for grounded answer generation | `llama3.2` |
+| `LLM_PROVIDER` | Provider for generation (`ollama` or `cloud`) | `ollama` |
+| `LLM_MODEL` | Model used for grounded answer generation | `llama3.2:1b` (local) / `llama-3.3-70b-versatile` (cloud) |
+| `LLM_API_URL` | Cloud LLM REST endpoint URL | `https://api.groq.com/openai/v1` |
+| `LLM_API_KEY` | API Key for Cloud LLM provider | `your_cloud_api_key` |
+| `EMBEDDING_PROVIDER` | Provider for embeddings (`ollama` or `cloud`) | `ollama` |
+| `EMBEDDING_MODEL` | Model used for dense vector embeddings | `nomic-embed-text` (local) / `text-embedding-004` (cloud) |
+| `EMBEDDING_API_URL` | Cloud Embedding REST endpoint URL | `https://generativelanguage.googleapis.com/v1beta/openai` |
+| `EMBEDDING_API_KEY` | API Key for Cloud Embedding provider | `your_cloud_api_key` |
+| `OLLAMA_HOST` | URL of local running Ollama instance | `http://localhost:11434` |
 | `OLLAMA_TIMEOUT` | Timeout in seconds for Ollama requests | `180.0` |
 | `CHROMA_PATH` | Directory for persistent ChromaDB storage | `./chroma_db` |
 | `DATABASE_PATH` | Path to SQLite database file | `./data/rag_app.db` |
