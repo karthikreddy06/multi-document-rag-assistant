@@ -1,4 +1,6 @@
-const API_BASE_URL = import.meta.env.VITE_API_URL ?? 'http://127.0.0.1:8000';
+const rawApiUrl = import.meta.env.VITE_API_URL;
+const sanitizedApiUrl = typeof rawApiUrl === 'string' ? rawApiUrl.replace(/^["'\s]+|["'\s]+$/g, '') : '';
+const API_BASE_URL = sanitizedApiUrl || (import.meta.env.DEV ? 'http://127.0.0.1:8000' : '');
 
 export interface HealthResponse {
   status: string;
