@@ -8,10 +8,10 @@ RUN npm ci
 
 COPY . .
 
-ARG VITE_API_URL
-ENV VITE_API_URL=${VITE_API_URL:-http://localhost:8000}
+ARG VITE_API_URL=""
+ENV VITE_API_URL=${VITE_API_URL}
 
-RUN npm run build
+RUN rm -f .env && npm run build
 
 # Stage 2: Serve static files with Nginx
 FROM nginx:alpine
