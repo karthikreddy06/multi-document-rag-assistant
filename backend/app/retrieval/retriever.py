@@ -579,7 +579,10 @@ class HybridRetriever:
 
         target_doc = self._match_target_document(subquery)
         if target_doc and where:
-            where_filter = {"$and": [where, {"filename": target_doc}]}
+            if "$and" in where and isinstance(where["$and"], list):
+                where_filter = {"$and": [*where["$and"], {"filename": target_doc}]}
+            else:
+                where_filter = {"$and": [where, {"filename": target_doc}]}
         elif target_doc:
             where_filter = {"filename": target_doc}
         elif where:
@@ -1020,7 +1023,10 @@ class HybridRetriever:
         logger.info(f"Executing PAGE_TARGETED retrieval for page {plan.target_page}")
         where_cond = {"page_number": plan.target_page}
         if plan.where_filter:
-            where_cond = {"$and": [plan.where_filter, where_cond]}
+            if "$and" in plan.where_filter and isinstance(plan.where_filter["$and"], list):
+                where_cond = {"$and": [*plan.where_filter["$and"], where_cond]}
+            else:
+                where_cond = {"$and": [plan.where_filter, where_cond]}
 
         raw_results = self.vector_store.collection.get(
             where=where_cond,
@@ -1082,7 +1088,10 @@ class HybridRetriever:
         for fn in target_doc_names:
             doc_where = {"filename": fn}
             if plan.where_filter:
-                doc_where = {"$and": [plan.where_filter, {"filename": fn}]}
+                if "$and" in plan.where_filter and isinstance(plan.where_filter["$and"], list):
+                    doc_where = {"$and": [*plan.where_filter["$and"], {"filename": fn}]}
+                else:
+                    doc_where = {"$and": [plan.where_filter, {"filename": fn}]}
 
             doc_chunks = self._retrieve_for_subquery(
                 subquery=plan.query,
@@ -1092,7 +1101,7 @@ class HybridRetriever:
             )
             if not doc_chunks:
                 try:
-                    res = self.vector_store.collection.get(where={"filename": fn}, limit=chunks_per_doc)
+                    res = self.vector_store.collection.get(where=doc_where, limit=chunks_per_doc)
                     docs = res.get("documents", [])
                     metas = res.get("metadatas", [])
                     for d_text, m in zip(docs, metas):

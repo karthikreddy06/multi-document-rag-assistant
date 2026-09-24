@@ -40,7 +40,7 @@ class IngestionPipeline:
         self.chunker = chunker or DocumentChunker()
         self.parser_registry = parser_registry or _parser_registry
 
-    def ingest_file(self, file_path: str | Path, force: bool = False) -> Dict[str, int]:
+    def ingest_file(self, file_path: str | Path, force: bool = False, user_id: Optional[str] = None) -> Dict[str, int]:
         """
         Ingest a single document file into the vector database.
 
@@ -96,6 +96,10 @@ class IngestionPipeline:
             logger.warning(f"No chunks generated from {path.name}.")
             return {"documents": len(documents), "chunks": 0}
 
+        if user_id:
+            for c in chunks:
+                c.metadata["user_id"] = user_id
+
         # Generate embeddings
         texts = [c.text for c in chunks]
         embeddings = self.embedding_service.embed_batch(texts)
@@ -112,10 +116,11 @@ class IngestionPipeline:
         original_filename: str,
         document_id: str,
         file_hash: Optional[str] = None,
+        user_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Ingest an uploaded document of any supported format, preserving original
-        filename and document_id metadata.
+        filename, user_id, and document_id metadata.
         """
         path = Path(file_path).resolve()
 
@@ -138,27 +143,32 @@ class IngestionPipeline:
             doc.metadata["filename"] = original_filename
             doc.metadata["document_id"] = document_id
             doc.metadata["file_hash"] = resolved_hash
+            if user_id:
+                doc.metadata["user_id"] = user_id
 
         chunks = self.chunker.split_documents(documents)
         if not chunks:
             logger.warning(f"No chunks generated from uploaded file {original_filename}.")
             return {"page_count": len(documents), "chunk_count": 0}
 
-        # Ensure every chunk carries document_id and clean original_filename
+        # Ensure every chunk carries document_id, user_id, and clean original_filename
         for c in chunks:
             c.metadata["document_id"] = document_id
             c.metadata["filename"] = original_filename
             c.metadata["file_hash"] = resolved_hash
+            if user_id:
+                c.metadata["user_id"] = user_id
 
         texts = [c.text for c in chunks]
         embeddings = self.embedding_service.embed_batch(texts)
         stored_count = self.vector_store.upsert_chunks(chunks, embeddings)
 
         logger.info(
-            f"Successfully ingested uploaded document '{original_filename}' ({document_id}): "
+            f"Successfully ingested uploaded document '{original_filename}' ({document_id}, user={user_id}): "
             f"{len(documents)} page(s)/sheet(s)/slide(s), {stored_count} chunks indexed."
         )
         return {"page_count": len(documents), "chunk_count": stored_count}
+
 
     def ingest_directory(self, dir_path: Optional[str | Path] = None, force: bool = False) -> Dict[str, int]:
         """

@@ -56,9 +56,38 @@ class VectorStore:
                 f"ChromaDB initialized at '{self.persist_path}'. "
                 f"Collection '{self.collection_name}' has {self.collection.count()} chunks."
             )
+            self._migrate_chunks_user_id()
         except Exception as e:
             logger.error(f"Failed to initialize ChromaDB at '{self.persist_path}': {e}")
             raise RuntimeError(f"ChromaDB initialization error: {e}") from e
+
+    def _migrate_chunks_user_id(self, default_user_id: str = "legacy_user") -> None:
+        """Idempotently ensure all existing chunks carry a user_id metadata field."""
+        try:
+            total = self.collection.count()
+            if total == 0:
+                return
+            raw = self.collection.get(include=["metadatas"])
+            ids = raw.get("ids", []) or []
+            metadatas = raw.get("metadatas", []) or []
+            to_update_ids = []
+            to_update_metas = []
+            for cid, meta in zip(ids, metadatas):
+                if meta is not None and "user_id" not in meta:
+                    new_meta = dict(meta)
+                    new_meta["user_id"] = default_user_id
+                    to_update_ids.append(cid)
+                    to_update_metas.append(new_meta)
+            if to_update_ids:
+                batch_size = 500
+                for i in range(0, len(to_update_ids), batch_size):
+                    self.collection.update(
+                        ids=to_update_ids[i : i + batch_size],
+                        metadatas=to_update_metas[i : i + batch_size],
+                    )
+                logger.info(f"Migrated {len(to_update_ids)} chunks to user_id='{default_user_id}'.")
+        except Exception as e:
+            logger.warning(f"Could not perform chunks user_id migration: {e}")
 
     def count(self) -> int:
         """Return total chunks in the collection."""
@@ -157,32 +186,61 @@ class VectorStore:
         """Retrieve all documents and metadata stored in the collection."""
         return self.collection.get()
 
-    def delete_by_filename(self, filename: str) -> int:
+    def delete_by_filename(self, filename: str, user_id: Optional[str] = None) -> int:
         """
-        Delete all chunks associated with a specific document filename.
+        Delete all chunks associated with a specific document filename, scoped by user_id if provided.
         Returns the count of chunks removed.
         """
         if not filename:
             return 0
         try:
-            records = self.collection.get(where={"filename": filename})
+            where_filter: Dict[str, Any] = {"filename": filename}
+            if user_id:
+                where_filter = {"$and": [{"filename": filename}, {"user_id": user_id}]}
+            records = self.collection.get(where=where_filter)
             ids_to_delete = records.get("ids", [])
             if ids_to_delete:
                 self.collection.delete(ids=ids_to_delete)
-                logger.info(f"Deleted {len(ids_to_delete)} stale chunks for file: {filename}")
+                logger.info(f"Deleted {len(ids_to_delete)} stale chunks for file: {filename} (user_id={user_id})")
                 return len(ids_to_delete)
             return 0
         except Exception as e:
             logger.error(f"Failed deleting chunks for {filename}: {e}")
             raise RuntimeError(f"ChromaDB delete failure: {e}") from e
 
-    def get_indexed_files(self) -> Dict[str, str]:
+    def delete_by_document_id(self, document_id: str, user_id: Optional[str] = None) -> int:
         """
-        Return a mapping of {filename: file_hash} for all currently indexed documents.
+        Delete all chunks associated with a specific document_id, scoped by user_id if provided.
+        Returns the count of chunks removed.
+        """
+        if not document_id:
+            return 0
+        try:
+            where_filter: Dict[str, Any] = {"document_id": document_id}
+            if user_id:
+                where_filter = {"$and": [{"document_id": document_id}, {"user_id": user_id}]}
+            records = self.collection.get(where=where_filter)
+            ids_to_delete = records.get("ids", [])
+            if ids_to_delete:
+                self.collection.delete(ids=ids_to_delete)
+                logger.info(f"Deleted {len(ids_to_delete)} chunks for document_id: {document_id} (user_id={user_id})")
+                return len(ids_to_delete)
+            return 0
+        except Exception as e:
+            logger.error(f"Failed deleting chunks for document_id '{document_id}': {e}")
+            raise RuntimeError(f"ChromaDB delete failure: {e}") from e
+
+    def get_indexed_files(self, user_id: Optional[str] = None) -> Dict[str, str]:
+        """
+        Return a mapping of {filename: file_hash} for currently indexed documents.
+        Scoped by user_id if provided.
         Uses metadata-only retrieval to avoid loading document texts into memory.
         """
         try:
-            records = self.collection.get(include=["metadatas"])
+            get_kwargs: Dict[str, Any] = {"include": ["metadatas"]}
+            if user_id:
+                get_kwargs["where"] = {"user_id": user_id}
+            records = self.collection.get(**get_kwargs)
             metadatas = records.get("metadatas", []) or []
             file_map: Dict[str, str] = {}
             for meta in metadatas:
@@ -194,4 +252,5 @@ class VectorStore:
         except Exception as e:
             logger.warning(f"Could not retrieve indexed files from ChromaDB: {e}")
             return {}
+
 

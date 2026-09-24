@@ -7,6 +7,8 @@ import {
   type ChatSession,
   type DocumentRecord,
 } from './api/client';
+import { useAuth } from './context/AuthContext';
+import { AuthPage } from './components/AuthPage';
 import './App.css';
 
 type Message = {
@@ -50,6 +52,8 @@ function getFileTypeLabel(filename: string): { label: string; color: string } {
 }
 
 function App() {
+  const { user, isAuthenticated, isLoading, logout } = useAuth();
+
   const [health, setHealth] = useState<HealthResponse | null>(null);
   const [documents, setDocuments] = useState<DocumentsResponse | null>(null);
   const [loadingInit, setLoadingInit] = useState(true);
@@ -79,58 +83,12 @@ function App() {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  // 1. Initial Load: Health, Global Documents, and Chat Sessions
-  useEffect(() => {
-    const initializeApp = async () => {
-      try {
-        setLoadingInit(true);
-        const [healthRes, docsRes, chatsRes] = await Promise.all([
-          api.health().catch(() => ({ status: 'offline' })),
-          api.documents().catch(() => null),
-          api.listChats().catch(() => []),
-        ]);
-
-        setHealth(healthRes);
-        setDocuments(docsRes);
-
-        let initialChatId: string | null = null;
-        if (chatsRes.length > 0) {
-          // Check localStorage preference
-          const savedChatId = localStorage.getItem('rag_active_chat_id');
-          const found = chatsRes.find((c) => c.id === savedChatId);
-          initialChatId = found ? found.id : chatsRes[0].id;
-          setChats(chatsRes);
-        } else {
-          // Auto-create initial default chat session
-          const newChat = await api.createChat('New Chat');
-          setChats([newChat]);
-          initialChatId = newChat.id;
-        }
-
-        if (initialChatId) {
-          await loadChatDetails(initialChatId);
-        }
-      } catch (err) {
-        setInitError(err instanceof Error ? err.message : 'Failed to connect to backend service');
-      } finally {
-        setLoadingInit(false);
-      }
-    };
-
-    initializeApp();
-  }, []);
-
-  // 2. Auto-scroll on new messages
-  useEffect(() => {
-    if (activeTab === 'chat') {
-      messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-    }
-  }, [messages, sending, activeTab]);
-
   // Helper: Load messages and documents for a specific chat
   const loadChatDetails = async (chatId: string) => {
     setActiveChatId(chatId);
-    localStorage.setItem('rag_active_chat_id', chatId);
+    if (user) {
+      localStorage.setItem(`rag_active_chat_${user.id}`, chatId);
+    }
     setSendError(null);
     setUploadError(null);
 
@@ -154,6 +112,67 @@ function App() {
       console.error('Failed to load chat details:', err);
     }
   };
+
+  const handleLogout = () => {
+    setChats([]);
+    setChatDocs([]);
+    setMessages([]);
+    setActiveChatId(null);
+    setDocuments(null);
+    logout();
+  };
+
+  // 1. Initial Load: Health, Global Documents, and Chat Sessions
+  useEffect(() => {
+    if (!isAuthenticated || !user) {
+      return;
+    }
+
+    const initializeApp = async () => {
+      try {
+        setLoadingInit(true);
+        const [healthRes, docsRes, chatsRes] = await Promise.all([
+          api.health().catch(() => ({ status: 'offline' })),
+          api.documents().catch(() => null),
+          api.listChats().catch(() => []),
+        ]);
+
+        setHealth(healthRes);
+        setDocuments(docsRes);
+
+        let initialChatId: string | null = null;
+        if (chatsRes.length > 0) {
+          // Check localStorage preference scoped by user id
+          const savedChatId = localStorage.getItem(`rag_active_chat_${user.id}`);
+          const found = chatsRes.find((c) => c.id === savedChatId);
+          initialChatId = found ? found.id : chatsRes[0].id;
+          setChats(chatsRes);
+        } else {
+          // Auto-create initial default chat session
+          const newChat = await api.createChat('New Chat');
+          setChats([newChat]);
+          initialChatId = newChat.id;
+        }
+
+        if (initialChatId) {
+          await loadChatDetails(initialChatId);
+        }
+      } catch (err) {
+        setInitError(err instanceof Error ? err.message : 'Failed to connect to backend service');
+      } finally {
+        setLoadingInit(false);
+      }
+    };
+
+    initializeApp();
+  }, [user?.id, isAuthenticated]);
+
+  // 2. Auto-scroll on new messages
+  useEffect(() => {
+    if (activeTab === 'chat') {
+      messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+    }
+  }, [messages, sending, activeTab]);
 
   // Switch Chat
   const handleSelectChat = async (chatId: string) => {
@@ -397,8 +416,23 @@ function App() {
   };
 
   const activeChat = chats.find((c) => c.id === activeChatId);
-  const docCount = documents ? documents.total_documents : 4;
-  const chunkCount = documents ? documents.total_chunks : 529;
+  const docCount = documents ? documents.total_documents : 0;
+  const chunkCount = documents ? documents.total_chunks : 0;
+
+  if (isLoading) {
+    return (
+      <div className="auth-page-root">
+        <div className="auth-loading-spinner-box">
+          <div className="auth-spinner large" />
+          <p className="auth-loading-text">Loading workspace...</p>
+        </div>
+      </div>
+    );
+  }
+
+  if (!isAuthenticated || !user) {
+    return <AuthPage />;
+  }
 
   return (
     <div className="layout-root">
@@ -556,6 +590,28 @@ function App() {
         </div>
 
         <div className="sidebar-bottom">
+          {user && (
+            <div className="sidebar-user-card">
+              <div className="user-avatar-pill">
+                <div className="user-initial">{user.email.charAt(0).toUpperCase()}</div>
+                <span className="user-email-label" title={user.email}>{user.email}</span>
+              </div>
+              <button
+                type="button"
+                className="user-logout-btn"
+                onClick={handleLogout}
+                title="Sign out of workspace"
+              >
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"></path>
+                  <polyline points="16 17 21 12 16 7"></polyline>
+                  <line x1="21" y1="12" x2="9" y2="12"></line>
+                </svg>
+                <span>Sign Out</span>
+              </button>
+            </div>
+          )}
+
           <p className="sidebar-tagline">
             Scoped knowledge<br />
             across your documents.
@@ -563,7 +619,7 @@ function App() {
           <div className="sidebar-divider" />
           <div className="sidebar-footer-note">
             <span className="sparkle-icon">✦</span>
-            <span>Phase 4 Active</span>
+            <span>Multi-User Isolated</span>
           </div>
         </div>
       </aside>
@@ -637,6 +693,27 @@ function App() {
               </svg>
               <span>{chunkCount} Chunks</span>
             </div>
+
+            {/* User Profile Pill */}
+            {user && (
+              <div className="user-profile-pill" title={`Logged in as ${user.email}`}>
+                <span className="user-pill-avatar">{user.email.charAt(0).toUpperCase()}</span>
+                <span className="user-pill-email">{user.email}</span>
+                <button
+                  type="button"
+                  className="user-pill-logout"
+                  onClick={handleLogout}
+                  title="Sign out"
+                  aria-label="Sign out"
+                >
+                  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+                    <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"></path>
+                    <polyline points="16 17 21 12 16 7"></polyline>
+                    <line x1="21" y1="12" x2="9" y2="12"></line>
+                  </svg>
+                </button>
+              </div>
+            )}
           </div>
         </header>
 

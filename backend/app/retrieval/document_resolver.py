@@ -249,5 +249,7 @@ class DocumentResolver:
             target_filter = {"$or": doc_filters}
 
         if base_filter:
+            if "$and" in base_filter and isinstance(base_filter["$and"], list):
+                return {"$and": [*base_filter["$and"], target_filter]}
             return {"$and": [base_filter, target_filter]}
         return target_filter

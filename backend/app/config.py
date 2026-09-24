@@ -82,6 +82,14 @@ class Settings(BaseSettings):
     # Logging settings
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
 
+    # Authentication & Security settings
+    jwt_secret_key: str = Field(
+        default="rag_assistant_dev_secret_key_change_in_production_32b+",
+        alias="JWT_SECRET_KEY"
+    )
+    jwt_algorithm: str = Field(default="HS256", alias="JWT_ALGORITHM")
+    jwt_access_token_expire_minutes: int = Field(default=1440, alias="JWT_ACCESS_TOKEN_EXPIRE_MINUTES")
+
     model_config = SettingsConfigDict(
         env_file=(".env", str(_BACKEND_DIR / ".env")),
         env_file_encoding="utf-8",

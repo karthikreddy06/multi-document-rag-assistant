@@ -1,6 +1,7 @@
 """
 FastAPI HTTP API Routes for Multi-Document RAG Assistant.
 Reuses existing RAGApplication orchestrator, retriever, vector store, and generation services.
+Enforces strict multi-user scoping and authentication on all user-facing resources.
 """
 
 import hashlib
@@ -16,6 +17,7 @@ from app.config import settings
 from app.ingestion.loader import FileTypeDetector
 from app.db import repository, init_db
 from app.main import RAGApplication
+from app.models import RetrievedChunk
 from app.utils.logger import setup_logger
 from app.api.schemas import (
     HealthResponse,
@@ -33,6 +35,7 @@ from app.api.schemas import (
     DocumentUploadResponse,
     ChatMessageResponse,
 )
+from app.api.auth import router as auth_router, get_current_user, get_current_user_id
 
 logger = setup_logger("api.routes")
 
@@ -55,6 +58,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Mount authentication router (Phase 2)
+app.include_router(auth_router)
+
 # Singleton container for RAGApplication
 _rag_app_instance: Optional[RAGApplication] = None
 
@@ -72,7 +78,7 @@ def get_rag_app() -> RAGApplication:
 
 
 # ------------------------------------------------------------------------------
-# 1. Health Endpoint
+# 1. Health Endpoint (Public)
 # ------------------------------------------------------------------------------
 @app.get("/api/health", response_model=HealthResponse, tags=["System"])
 def health_check() -> HealthResponse:
@@ -81,16 +87,25 @@ def health_check() -> HealthResponse:
 
 
 # ------------------------------------------------------------------------------
-# 2. Documents Metadata Endpoint
+# 2. Documents Metadata & Catalog Endpoints (User Scoped)
 # ------------------------------------------------------------------------------
 @app.get("/api/documents", response_model=DocumentsResponse, tags=["Documents"])
-def get_documents(rag_app: RAGApplication = Depends(get_rag_app)) -> DocumentsResponse:
+def get_documents(
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    rag_app: RAGApplication = Depends(get_rag_app),
+) -> DocumentsResponse:
     """
-    Return currently indexed documents and existing metadata from ChromaDB.
+    Return currently indexed documents and existing metadata strictly scoped to the authenticated user.
     """
+    user_id = str(current_user["id"])
     try:
-        indexed_map = rag_app.vector_store.get_indexed_files()
-        total_chunks = rag_app.vector_store.count()
+        indexed_map = rag_app.vector_store.get_indexed_files(user_id=user_id)
+        raw = rag_app.vector_store.collection.get(
+            where={"user_id": user_id},
+            include=["metadatas"],
+        )
+        metadatas = raw.get("metadatas", []) or []
+        total_chunks = len(metadatas)
 
         if total_chunks == 0:
             return DocumentsResponse(
@@ -98,10 +113,6 @@ def get_documents(rag_app: RAGApplication = Depends(get_rag_app)) -> DocumentsRe
                 total_chunks=0,
                 documents=[],
             )
-
-        # Retrieve all chunk metadata from the active collection
-        raw = rag_app.vector_store.collection.get(include=["metadatas"])
-        metadatas = raw.get("metadatas", []) or []
 
         # Aggregate per-document statistics
         doc_stats: Dict[str, Dict[str, Any]] = {}
@@ -142,24 +153,82 @@ def get_documents(rag_app: RAGApplication = Depends(get_rag_app)) -> DocumentsRe
             documents=doc_list,
         )
     except Exception as e:
-        logger.error(f"Error retrieving documents metadata: {e}")
+        logger.error(f"Error retrieving documents metadata for user {user_id}: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to retrieve document metadata from vector store."
         )
 
 
+@app.get(
+    "/api/documents/{document_id}",
+    response_model=DocumentRecordResponse,
+    tags=["Documents"],
+)
+def get_document(
+    document_id: str,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+) -> DocumentRecordResponse:
+    """
+    Retrieve a single document from the catalog by ID, verifying ownership.
+    """
+    user_id = str(current_user["id"])
+    doc = repository.get_document_by_id(document_id, user_id=user_id)
+    if not doc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Document '{document_id}' not found.",
+        )
+    return DocumentRecordResponse(**doc)
+
+
+@app.delete(
+    "/api/documents/{document_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    tags=["Documents"],
+)
+def delete_document(
+    document_id: str,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    rag_app: RAGApplication = Depends(get_rag_app),
+) -> Response:
+    """
+    Delete a document record and its associated ChromaDB chunks, verifying ownership.
+    """
+    user_id = str(current_user["id"])
+    doc = repository.get_document_by_id(document_id, user_id=user_id)
+    if not doc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Document '{document_id}' not found.",
+        )
+
+    deleted = repository.delete_document(document_id, user_id=user_id)
+    if not deleted:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Document '{document_id}' not found.",
+        )
+
+    # Clean up associated vector chunks
+    rag_app.vector_store.delete_by_document_id(document_id, user_id=user_id)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
 # ------------------------------------------------------------------------------
-# 3. Chat Endpoint
+# 3. Global Chat Endpoint (User Scoped)
 # ------------------------------------------------------------------------------
 @app.post("/api/chat", response_model=ChatResponse, tags=["Chat"])
 def chat(
     request: ChatRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user),
     rag_app: RAGApplication = Depends(get_rag_app),
 ) -> ChatResponse:
     """
-    Execute grounded RAG query through existing retriever and LLM generator.
+    Execute grounded RAG query through existing retriever and LLM generator,
+    strictly scoped to authenticated user's documents.
     """
+    user_id = str(current_user["id"])
     query = request.query.strip()
     if not query:
         raise HTTPException(
@@ -168,14 +237,14 @@ def chat(
         )
 
     try:
-        # 1. Retrieve relevant chunks using Adaptive RAG
+        user_where = {"user_id": user_id}
         chunks: List[RetrievedChunk] = []
         plan = None
         num_pred, num_ctx = None, None
 
         if hasattr(rag_app.retriever, "retrieve_adaptive"):
             try:
-                res = rag_app.retriever.retrieve_adaptive(query=query)
+                res = rag_app.retriever.retrieve_adaptive(query=query, where=user_where)
                 if isinstance(res, tuple) and len(res) == 3:
                     chunks, plan, coverage = res
                     budget = getattr(plan, "generation_budget", None)
@@ -184,11 +253,11 @@ def chat(
                 elif isinstance(res, list):
                     chunks = res
                 else:
-                    chunks = rag_app.retriever.retrieve(query)
+                    chunks = rag_app.retriever.retrieve(query, where=user_where)
             except Exception:
-                chunks = rag_app.retriever.retrieve(query)
+                chunks = rag_app.retriever.retrieve(query, where=user_where)
         else:
-            chunks = rag_app.retriever.retrieve(query)
+            chunks = rag_app.retriever.retrieve(query, where=user_where)
 
         # 2. Generate grounded answer using dynamic generation budget
         answer = rag_app.generator.generate_answer(
@@ -217,7 +286,7 @@ def chat(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error processing chat query '{query}': {e}")
+        logger.error(f"Error processing chat query '{query}' for user {user_id}: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to generate answer from documents.",
@@ -225,15 +294,20 @@ def chat(
 
 
 # ------------------------------------------------------------------------------
-# 4. Ingest Endpoint
+# 4. Ingest Endpoint (User Scoped)
 # ------------------------------------------------------------------------------
 @app.post("/api/ingest", response_model=IngestResponse, tags=["Ingestion"])
-def trigger_ingestion(rag_app: RAGApplication = Depends(get_rag_app)) -> IngestResponse:
+def trigger_ingestion(
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    rag_app: RAGApplication = Depends(get_rag_app),
+) -> IngestResponse:
     """
-    Trigger incremental document ingestion on the documents directory.
+    Trigger incremental document ingestion on the documents directory,
+    tagging chunks with the authenticated user ID.
     """
+    user_id = str(current_user["id"])
     try:
-        res = rag_app.pipeline.ingest_directory(force=False)
+        res = rag_app.pipeline.ingest_directory(force=False, user_id=user_id)
         docs_count = res.get("documents", 0)
         chunks_count = res.get("chunks", 0)
         return IngestResponse(
@@ -243,7 +317,7 @@ def trigger_ingestion(rag_app: RAGApplication = Depends(get_rag_app)) -> IngestR
             message=f"Ingestion completed. Processed {docs_count} documents, stored {chunks_count} chunks.",
         )
     except Exception as e:
-        logger.error(f"Ingestion failed: {e}")
+        logger.error(f"Ingestion failed for user {user_id}: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Document ingestion failed.",
@@ -251,16 +325,20 @@ def trigger_ingestion(rag_app: RAGApplication = Depends(get_rag_app)) -> IngestR
 
 
 # ------------------------------------------------------------------------------
-# 5. Reindex Endpoint
+# 5. Reindex Endpoint (User Scoped)
 # ------------------------------------------------------------------------------
 @app.post("/api/reindex", response_model=ReindexResponse, tags=["Ingestion"])
-def trigger_reindex(rag_app: RAGApplication = Depends(get_rag_app)) -> ReindexResponse:
+def trigger_reindex(
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    rag_app: RAGApplication = Depends(get_rag_app),
+) -> ReindexResponse:
     """
-    Clear vector store and re-index all documents from scratch.
+    Clear vector store and re-index all documents from scratch for the authenticated user.
     """
+    user_id = str(current_user["id"])
     try:
         rag_app.vector_store.clear()
-        res = rag_app.pipeline.ingest_directory(force=True)
+        res = rag_app.pipeline.ingest_directory(force=True, user_id=user_id)
         docs_count = res.get("documents", 0)
         chunks_count = res.get("chunks", 0)
         return ReindexResponse(
@@ -270,7 +348,7 @@ def trigger_reindex(rag_app: RAGApplication = Depends(get_rag_app)) -> ReindexRe
             message=f"Reindexing completed. Cleared database and indexed {chunks_count} chunks from {docs_count} documents.",
         )
     except Exception as e:
-        logger.error(f"Reindexing failed: {e}")
+        logger.error(f"Reindexing failed for user {user_id}: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Document reindexing failed.",
@@ -278,18 +356,21 @@ def trigger_reindex(rag_app: RAGApplication = Depends(get_rag_app)) -> ReindexRe
 
 
 # ------------------------------------------------------------------------------
-# 6. Chat Session CRUD Endpoints
+# 6. Chat Session CRUD Endpoints (User Scoped)
 # ------------------------------------------------------------------------------
 @app.get("/api/chats", response_model=List[ChatSessionResponse], tags=["Chats"])
-def list_chats() -> List[ChatSessionResponse]:
+def list_chats(
+    current_user: Dict[str, Any] = Depends(get_current_user),
+) -> List[ChatSessionResponse]:
     """
-    Retrieve all chat sessions ordered by updated_at DESC.
+    Retrieve all chat sessions owned by the authenticated user ordered by updated_at DESC.
     """
+    user_id = str(current_user["id"])
     try:
-        chats = repository.list_chats()
+        chats = repository.list_chats(user_id=user_id)
         return [ChatSessionResponse(**c) for c in chats]
     except Exception as e:
-        logger.error(f"Error listing chats: {e}")
+        logger.error(f"Error listing chats for user {user_id}: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to retrieve chats.",
@@ -302,16 +383,20 @@ def list_chats() -> List[ChatSessionResponse]:
     status_code=status.HTTP_201_CREATED,
     tags=["Chats"],
 )
-def create_chat(request: Optional[ChatCreateRequest] = None) -> ChatSessionResponse:
+def create_chat(
+    request: Optional[ChatCreateRequest] = None,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+) -> ChatSessionResponse:
     """
-    Create a new chat session. Defaults title to 'New Chat' if omitted or empty.
+    Create a new chat session owned by the authenticated user.
     """
+    user_id = str(current_user["id"])
     try:
         title = (request.title if (request and request.title) else "New Chat")
-        chat_data = repository.create_chat(title=title)
+        chat_data = repository.create_chat(title=title, user_id=user_id)
         return ChatSessionResponse(**chat_data)
     except Exception as e:
-        logger.error(f"Error creating chat: {e}")
+        logger.error(f"Error creating chat for user {user_id}: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to create chat.",
@@ -319,11 +404,15 @@ def create_chat(request: Optional[ChatCreateRequest] = None) -> ChatSessionRespo
 
 
 @app.get("/api/chats/{chat_id}", response_model=ChatSessionResponse, tags=["Chats"])
-def get_chat(chat_id: str) -> ChatSessionResponse:
+def get_chat(
+    chat_id: str,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+) -> ChatSessionResponse:
     """
-    Retrieve a single chat session by ID.
+    Retrieve a single chat session by ID, verifying user ownership.
     """
-    chat_data = repository.get_chat(chat_id)
+    user_id = str(current_user["id"])
+    chat_data = repository.get_chat(chat_id, user_id=user_id)
     if not chat_data:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -333,12 +422,17 @@ def get_chat(chat_id: str) -> ChatSessionResponse:
 
 
 @app.patch("/api/chats/{chat_id}", response_model=ChatSessionResponse, tags=["Chats"])
-def rename_chat(chat_id: str, request: ChatRenameRequest) -> ChatSessionResponse:
+def rename_chat(
+    chat_id: str,
+    request: ChatRenameRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+) -> ChatSessionResponse:
     """
-    Rename an existing chat session.
+    Rename an existing chat session, verifying user ownership.
     """
+    user_id = str(current_user["id"])
     try:
-        updated = repository.rename_chat(chat_id, request.title)
+        updated = repository.rename_chat(chat_id, request.title, user_id=user_id)
         if not updated:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
@@ -353,7 +447,7 @@ def rename_chat(chat_id: str, request: ChatRenameRequest) -> ChatSessionResponse
             detail=str(ve),
         )
     except Exception as e:
-        logger.error(f"Error renaming chat '{chat_id}': {e}")
+        logger.error(f"Error renaming chat '{chat_id}' for user {user_id}: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to rename chat.",
@@ -361,12 +455,16 @@ def rename_chat(chat_id: str, request: ChatRenameRequest) -> ChatSessionResponse
 
 
 @app.delete("/api/chats/{chat_id}", status_code=status.HTTP_204_NO_CONTENT, tags=["Chats"])
-def delete_chat(chat_id: str) -> Response:
+def delete_chat(
+    chat_id: str,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+) -> Response:
     """
-    Delete a chat session, its messages, and chat-document relationships.
+    Delete a chat session and all its cascade records, verifying user ownership.
     """
+    user_id = str(current_user["id"])
     try:
-        deleted = repository.delete_chat(chat_id)
+        deleted = repository.delete_chat(chat_id, user_id=user_id)
         if not deleted:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
@@ -376,7 +474,7 @@ def delete_chat(chat_id: str) -> Response:
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error deleting chat '{chat_id}': {e}")
+        logger.error(f"Error deleting chat '{chat_id}' for user {user_id}: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to delete chat.",
@@ -384,7 +482,7 @@ def delete_chat(chat_id: str) -> Response:
 
 
 # ------------------------------------------------------------------------------
-# 7. Chat Document Management Endpoints (Phases 4.4, 4.5, 4.9)
+# 7. Chat Document Management Endpoints (User Scoped)
 # ------------------------------------------------------------------------------
 MAX_UPLOAD_SIZE = 50 * 1024 * 1024  # 50 MB limit
 
@@ -398,18 +496,19 @@ MAX_UPLOAD_SIZE = 50 * 1024 * 1024  # 50 MB limit
 def upload_document_to_chat(
     chat_id: str,
     file: UploadFile = File(...),
+    current_user: Dict[str, Any] = Depends(get_current_user),
     rag_app: RAGApplication = Depends(get_rag_app),
 ) -> DocumentUploadResponse:
     """
-    Upload and attach a document to a chat session.
+    Upload and attach a document to a chat session, verifying ownership.
     Supports PDF, DOCX, PPTX, XLSX, CSV, TXT, MD, and image files.
-    Validates extension against supported types, enforces 50MB size limit,
-    sanitizes filename, computes SHA-256 hash, stores in backend/data/uploads/,
-    and indexes into ChromaDB via the ParserRegistry.
-    Reuses existing document records if SHA-256 already exists and is ready.
+    Enforces 50MB size limit, sanitizes filename, computes SHA-256,
+    stores under backend/data/uploads/, and indexes into ChromaDB with user_id.
     """
-    # 1. Verify chat exists
-    chat = repository.get_chat(chat_id)
+    user_id = str(current_user["id"])
+
+    # 1. Verify chat exists and is owned by authenticated user
+    chat = repository.get_chat(chat_id, user_id=user_id)
     if not chat:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -418,9 +517,7 @@ def upload_document_to_chat(
 
     # 2. Filename validation and sanitization against path traversal
     raw_filename = file.filename or ""
-    # Extract only the base name (prevents directory traversal e.g. ../../)
     safe_name = Path(raw_filename).name
-    # Strip dangerous characters and null bytes
     safe_name = re.sub(r"[\x00/\\:*?\"<>|]", "_", safe_name).strip()
 
     if not safe_name:
@@ -461,7 +558,7 @@ def upload_document_to_chat(
             detail="File size exceeds maximum permitted limit of 50 MB.",
         )
 
-    # 4. Magic-byte validation (format-agnostic; returns True for formats with no magic bytes)
+    # 4. Magic-byte validation
     detected_format = FileTypeDetector.detect_format(Path(safe_name))
     if not FileTypeDetector.validate_magic_bytes(content, detected_format):
         raise HTTPException(
@@ -475,7 +572,7 @@ def upload_document_to_chat(
     # 5. Compute SHA-256 hash
     file_hash = hashlib.sha256(content).hexdigest()
 
-    # 6. Save file under backend/data/uploads/ using hash + original extension for correct parser dispatch
+    # 6. Save file under backend/data/uploads/ using hash + original extension
     upload_dir = settings.upload_abs_path
     upload_dir.mkdir(parents=True, exist_ok=True)
     stored_path = upload_dir / f"{file_hash}{file_ext}"
@@ -485,27 +582,27 @@ def upload_document_to_chat(
 
     safe_rel_path = f"uploads/{file_hash}{file_ext}"
 
-    # 7. Check if document record already exists in catalog
-    existing_doc = repository.get_document_by_hash(file_hash)
+    # 7. Check if document record already exists in catalog for THIS authenticated user
+    existing_doc = repository.get_document_by_hash(file_hash, user_id=user_id)
     if existing_doc is not None:
         doc_id = existing_doc["id"]
-        # Idempotently attach to chat
-        repository.attach_document_to_chat(chat_id, doc_id)
+        repository.attach_document_to_chat(chat_id, doc_id, user_id=user_id)
 
-        # If already ready, reuse without any reprocessing
+        # If already ready, reuse without reprocessing
         if existing_doc["status"] == "ready":
-            attached_docs = repository.list_chat_documents(chat_id)
+            attached_docs = repository.list_chat_documents(chat_id, user_id=user_id)
             attached_rec = next((d for d in attached_docs if d["id"] == doc_id), existing_doc)
             return DocumentUploadResponse(
                 message="Existing document attached to chat without reprocessing.",
                 document=DocumentRecordResponse(**attached_rec),
             )
     else:
-        # Check if already present in vector store from pre-existing documents
-        indexed_files = rag_app.vector_store.get_indexed_files()
+        # Check if already present in vector store for THIS user
+        indexed_files = rag_app.vector_store.get_indexed_files(user_id=user_id)
         if file_hash in indexed_files.values():
-            # Count existing chunks
-            res = rag_app.vector_store.collection.get(where={"file_hash": file_hash})
+            res = rag_app.vector_store.collection.get(
+                where={"$and": [{"file_hash": file_hash}, {"user_id": user_id}]}
+            )
             cnt = len(res.get("ids", []))
             new_doc = repository.create_document(
                 filename=safe_name,
@@ -514,35 +611,38 @@ def upload_document_to_chat(
                 chunk_count=cnt,
                 storage_path=safe_rel_path,
                 status="ready",
+                user_id=user_id,
             )
             doc_id = new_doc["id"]
-            repository.attach_document_to_chat(chat_id, doc_id)
-            attached_docs = repository.list_chat_documents(chat_id)
+            repository.attach_document_to_chat(chat_id, doc_id, user_id=user_id)
+            attached_docs = repository.list_chat_documents(chat_id, user_id=user_id)
             attached_rec = next((d for d in attached_docs if d["id"] == doc_id), new_doc)
             return DocumentUploadResponse(
                 message="Document registered from existing vector store and attached to chat.",
                 document=DocumentRecordResponse(**attached_rec),
             )
         else:
-            # Register new pending document
+            # Register new pending document for authenticated user
             new_doc = repository.create_document(
                 filename=safe_name,
                 file_hash=file_hash,
                 file_size=file_size,
                 storage_path=safe_rel_path,
                 status="pending",
+                user_id=user_id,
             )
             doc_id = new_doc["id"]
-            repository.attach_document_to_chat(chat_id, doc_id)
+            repository.attach_document_to_chat(chat_id, doc_id, user_id=user_id)
 
-    # 8. Document Processing / Indexing
-    repository.update_document_status(doc_id, status="processing")
+    # 8. Document Processing / Indexing with user_id
+    repository.update_document_status(doc_id, status="processing", user_id=user_id)
     try:
         ingest_res = rag_app.pipeline.ingest_uploaded_document(
             file_path=stored_path,
             original_filename=safe_name,
             document_id=doc_id,
             file_hash=file_hash,
+            user_id=user_id,
         )
         ready_doc = repository.update_document_status(
             doc_id,
@@ -550,21 +650,23 @@ def upload_document_to_chat(
             page_count=ingest_res.get("page_count", 0),
             chunk_count=ingest_res.get("chunk_count", 0),
             storage_path=safe_rel_path,
+            user_id=user_id,
         )
-        attached_docs = repository.list_chat_documents(chat_id)
+        attached_docs = repository.list_chat_documents(chat_id, user_id=user_id)
         attached_rec = next((d for d in attached_docs if d["id"] == doc_id), ready_doc)
         return DocumentUploadResponse(
             message="Document uploaded, parsed, and indexed successfully.",
             document=DocumentRecordResponse(**attached_rec),
         )
     except Exception as e:
-        logger.error(f"Error processing uploaded document {doc_id}: {e}")
+        logger.error(f"Error processing uploaded document {doc_id} for user {user_id}: {e}")
         failed_doc = repository.update_document_status(
             doc_id,
             status="failed",
             error_message=f"Failed to parse and index document: {type(e).__name__}",
+            user_id=user_id,
         )
-        attached_docs = repository.list_chat_documents(chat_id)
+        attached_docs = repository.list_chat_documents(chat_id, user_id=user_id)
         attached_rec = next((d for d in attached_docs if d["id"] == doc_id), failed_doc)
         return DocumentUploadResponse(
             message="Document upload recorded, but processing failed.",
@@ -577,17 +679,21 @@ def upload_document_to_chat(
     response_model=List[DocumentRecordResponse],
     tags=["Chat Documents"],
 )
-def list_chat_documents(chat_id: str) -> List[DocumentRecordResponse]:
+def list_chat_documents(
+    chat_id: str,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+) -> List[DocumentRecordResponse]:
     """
-    List all documents attached to a specific chat session.
+    List all documents attached to a specific chat session, verifying ownership.
     """
-    chat = repository.get_chat(chat_id)
+    user_id = str(current_user["id"])
+    chat = repository.get_chat(chat_id, user_id=user_id)
     if not chat:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Chat '{chat_id}' not found.",
         )
-    docs = repository.list_chat_documents(chat_id)
+    docs = repository.list_chat_documents(chat_id, user_id=user_id)
     return [DocumentRecordResponse(**d) for d in docs]
 
 
@@ -596,19 +702,24 @@ def list_chat_documents(chat_id: str) -> List[DocumentRecordResponse]:
     status_code=status.HTTP_204_NO_CONTENT,
     tags=["Chat Documents"],
 )
-def remove_document_from_chat(chat_id: str, document_id: str) -> Response:
+def remove_document_from_chat(
+    chat_id: str,
+    document_id: str,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+) -> Response:
     """
-    Detach a document from a chat session.
-    Does NOT delete the document from the global catalog or ChromaDB.
+    Detach a document from a chat session, verifying ownership.
+    Does NOT delete the document from the catalog or ChromaDB.
     """
-    chat = repository.get_chat(chat_id)
+    user_id = str(current_user["id"])
+    chat = repository.get_chat(chat_id, user_id=user_id)
     if not chat:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Chat '{chat_id}' not found.",
         )
 
-    detached = repository.detach_document_from_chat(chat_id, document_id)
+    detached = repository.detach_document_from_chat(chat_id, document_id, user_id=user_id)
     if not detached:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -618,7 +729,7 @@ def remove_document_from_chat(chat_id: str, document_id: str) -> Response:
 
 
 # ------------------------------------------------------------------------------
-# 8. Chat-Scoped Query and Message Persistence (Phases 4.6, 4.7)
+# 8. Chat-Scoped Query and Message Persistence (User Scoped)
 # ------------------------------------------------------------------------------
 @app.post(
     "/api/chats/{chat_id}/chat",
@@ -628,13 +739,16 @@ def remove_document_from_chat(chat_id: str, document_id: str) -> Response:
 def chat_in_session(
     chat_id: str,
     request: ChatRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user),
     rag_app: RAGApplication = Depends(get_rag_app),
 ) -> ChatResponse:
     """
-    Execute a chat question scoped strictly to documents attached to this chat session.
+    Execute a chat question scoped strictly to documents attached to this chat session
+    and owned by the authenticated user.
     Persists user message and assistant answer with sources into SQLite.
     """
-    chat = repository.get_chat(chat_id)
+    user_id = str(current_user["id"])
+    chat = repository.get_chat(chat_id, user_id=user_id)
     if not chat:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -649,45 +763,47 @@ def chat_in_session(
         )
 
     # Retrieve ready documents attached to this chat
-    attached_docs = repository.list_chat_documents(chat_id)
+    attached_docs = repository.list_chat_documents(chat_id, user_id=user_id)
     ready_docs = [d for d in attached_docs if d["status"] == "ready"]
 
     # If no ready documents are attached, return clean response and persist
     if not ready_docs:
         notice = "No ready documents are attached to this chat. Please upload and attach a PDF document before asking questions."
-        repository.create_message(chat_id=chat_id, role="user", content=query)
-        repository.create_message(chat_id=chat_id, role="assistant", content=notice, sources_json=[])
+        repository.create_message(chat_id=chat_id, role="user", content=query, user_id=user_id)
+        repository.create_message(chat_id=chat_id, role="assistant", content=notice, sources_json=[], user_id=user_id)
         return ChatResponse(answer=notice, sources=[])
 
-    # Construct strict Chroma filter restricting retrieval to attached ready documents
+    # Construct strict Chroma filter restricting retrieval to authenticated user + attached ready docs
+    user_cond = {"user_id": user_id}
     if len(ready_docs) == 1:
         doc = ready_docs[0]
         if doc.get("file_hash"):
-            where_filter = {
+            doc_cond = {
                 "$or": [
                     {"document_id": doc["id"]},
                     {"file_hash": doc["file_hash"]},
                 ]
             }
         else:
-            where_filter = {"document_id": doc["id"]}
+            doc_cond = {"document_id": doc["id"]}
     else:
         doc_ids = [d["id"] for d in ready_docs]
         doc_hashes = [d["file_hash"] for d in ready_docs if d.get("file_hash")]
-        where_filter = {
+        doc_cond = {
             "$or": [
                 {"document_id": {"$in": doc_ids}},
                 {"file_hash": {"$in": doc_hashes}},
             ]
         }
+    where_filter = {"$and": [user_cond, doc_cond]}
 
-    recent_messages = repository.list_messages(chat_id)
+    recent_messages = repository.list_messages(chat_id, user_id=user_id)
 
     try:
         import time
         start_time = time.time()
 
-        # Retrieve candidate chunks scoped to chat documents using Adaptive RAG
+        # Retrieve candidate chunks scoped strictly to user and chat documents using Adaptive RAG
         chunks, plan, coverage = rag_app.retriever.retrieve_adaptive(
             query=query,
             where=where_filter,
@@ -727,12 +843,11 @@ def chat_in_session(
         # Structured debug telemetry
         logger.info(
             f"\n--- RAG EXECUTION TELEMETRY ---\n"
+            f"USER: {user_id}\n"
             f"QUERY: {query}\n"
             f"QUERY TYPE: {plan.strategy.value}\n"
             f"TARGET DOCUMENTS: {[d.filename for d in plan.target_documents]}\n"
             f"RETRIEVAL PLAN: {plan.strategy.name} (k={plan.candidate_k})\n"
-            f"ASPECTS: {plan.aspects}\n"
-            f"CANDIDATE COUNT: {plan.candidate_k}\n"
             f"FINAL CHUNK COUNT: {len(chunks)}\n"
             f"PAGE COVERAGE: {coverage.pages_covered}\n"
             f"DOCUMENT COVERAGE: {coverage.documents_covered}\n"
@@ -742,23 +857,23 @@ def chat_in_session(
             f"-------------------------------"
         )
 
-        # Persist messages in database
-        repository.create_message(chat_id=chat_id, role="user", content=query)
+        # Persist messages in database scoped to user
+        repository.create_message(chat_id=chat_id, role="user", content=query, user_id=user_id)
         sources_payload = [s.model_dump() for s in sources]
         repository.create_message(
             chat_id=chat_id,
             role="assistant",
             content=answer,
             sources_json=sources_payload,
+            user_id=user_id,
         )
 
         return ChatResponse(answer=answer, sources=sources)
     except Exception as e:
-        logger.error(f"Error during chat in session '{chat_id}': {e}")
-        # Clean safe error message
+        logger.error(f"Error during chat in session '{chat_id}' for user {user_id}: {e}")
         safe_msg = "An error occurred while generating an answer from the attached documents."
-        repository.create_message(chat_id=chat_id, role="user", content=query)
-        repository.create_message(chat_id=chat_id, role="assistant", content=safe_msg, sources_json=[])
+        repository.create_message(chat_id=chat_id, role="user", content=query, user_id=user_id)
+        repository.create_message(chat_id=chat_id, role="assistant", content=safe_msg, sources_json=[], user_id=user_id)
         return ChatResponse(answer=safe_msg, sources=[])
 
 
@@ -769,13 +884,16 @@ def chat_in_session(
 def chat_in_session_stream(
     chat_id: str,
     request: ChatRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user),
     rag_app: RAGApplication = Depends(get_rag_app),
 ) -> StreamingResponse:
     """
-    Stream token chunks via Server-Sent Events (SSE) for low perceived latency.
+    Stream token chunks via Server-Sent Events (SSE) for low perceived latency,
+    strictly scoped to authenticated user documents.
     Persists user message and completed assistant response with sources upon completion.
     """
-    chat = repository.get_chat(chat_id)
+    user_id = str(current_user["id"])
+    chat = repository.get_chat(chat_id, user_id=user_id)
     if not chat:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -789,13 +907,13 @@ def chat_in_session_stream(
             detail="Query string must not be empty.",
         )
 
-    attached_docs = repository.list_chat_documents(chat_id)
+    attached_docs = repository.list_chat_documents(chat_id, user_id=user_id)
     ready_docs = [d for d in attached_docs if d["status"] == "ready"]
 
     if not ready_docs:
         notice = "No ready documents are attached to this chat. Please upload and attach a PDF document before asking questions."
-        repository.create_message(chat_id=chat_id, role="user", content=query)
-        repository.create_message(chat_id=chat_id, role="assistant", content=notice, sources_json=[])
+        repository.create_message(chat_id=chat_id, role="user", content=query, user_id=user_id)
+        repository.create_message(chat_id=chat_id, role="assistant", content=notice, sources_json=[], user_id=user_id)
 
         def empty_generator():
             yield f"data: {json.dumps({'type': 'token', 'token': notice})}\n\n"
@@ -804,28 +922,30 @@ def chat_in_session_stream(
 
         return StreamingResponse(empty_generator(), media_type="text/event-stream")
 
+    user_cond = {"user_id": user_id}
     if len(ready_docs) == 1:
         doc = ready_docs[0]
         if doc.get("file_hash"):
-            where_filter = {
+            doc_cond = {
                 "$or": [
                     {"document_id": doc["id"]},
                     {"file_hash": doc["file_hash"]},
                 ]
             }
         else:
-            where_filter = {"document_id": doc["id"]}
+            doc_cond = {"document_id": doc["id"]}
     else:
         doc_ids = [d["id"] for d in ready_docs]
         doc_hashes = [d["file_hash"] for d in ready_docs if d.get("file_hash")]
-        where_filter = {
+        doc_cond = {
             "$or": [
                 {"document_id": {"$in": doc_ids}},
                 {"file_hash": {"$in": doc_hashes}},
             ]
         }
+    where_filter = {"$and": [user_cond, doc_cond]}
 
-    recent_messages = repository.list_messages(chat_id)
+    recent_messages = repository.list_messages(chat_id, user_id=user_id)
 
     chunks, plan, coverage = rag_app.retriever.retrieve_adaptive(
         query=query,
@@ -862,41 +982,49 @@ def chat_in_session_stream(
                 yield f"data: {json.dumps({'type': 'token', 'token': token})}\n\n"
 
             full_answer = "".join(accumulated_tokens).strip()
-            repository.create_message(chat_id=chat_id, role="user", content=query)
+            repository.create_message(chat_id=chat_id, role="user", content=query, user_id=user_id)
             sources_payload = [s.model_dump() for s in sources]
             repository.create_message(
                 chat_id=chat_id,
                 role="assistant",
                 content=full_answer,
                 sources_json=sources_payload,
+                user_id=user_id,
             )
             yield f"data: {json.dumps({'type': 'sources', 'sources': sources_payload})}\n\n"
             yield "data: [DONE]\n\n"
         except Exception as err:
-            logger.error(f"Error during streaming in chat '{chat_id}': {err}")
+            logger.error(f"Error during streaming in chat '{chat_id}' for user {user_id}: {err}")
             yield f"data: {json.dumps({'type': 'error', 'error': 'Failed to complete streaming response.'})}\n\n"
             yield f"data: {json.dumps({'type': 'error', 'error': str(err)})}\n\n"
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
 
 
+# ------------------------------------------------------------------------------
+# 9. Message History Endpoint (User Scoped)
+# ------------------------------------------------------------------------------
 @app.get(
     "/api/chats/{chat_id}/messages",
     response_model=List[ChatMessageResponse],
     tags=["Chat Messages"],
 )
-def get_chat_messages(chat_id: str) -> List[ChatMessageResponse]:
+def get_chat_messages(
+    chat_id: str,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+) -> List[ChatMessageResponse]:
     """
-    Retrieve chronological message history for a specific chat session.
+    Retrieve chronological message history for a specific chat session, verifying user ownership.
     """
-    chat = repository.get_chat(chat_id)
+    user_id = str(current_user["id"])
+    chat = repository.get_chat(chat_id, user_id=user_id)
     if not chat:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Chat '{chat_id}' not found.",
         )
 
-    raw_messages = repository.list_messages(chat_id)
+    raw_messages = repository.list_messages(chat_id, user_id=user_id)
     result: List[ChatMessageResponse] = []
     for m in raw_messages:
         sources_list: List[SourceChunk] = []
@@ -919,5 +1047,3 @@ def get_chat_messages(chat_id: str) -> List[ChatMessageResponse]:
             )
         )
     return result
-
-
