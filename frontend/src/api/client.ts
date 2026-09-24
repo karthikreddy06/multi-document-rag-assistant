@@ -316,8 +316,8 @@ export const api = {
 
       for (const line of lines) {
         const trimmed = line.trim();
-        if (!trimmed || !trimmed.startsWith('data: ')) continue;
-        const dataStr = trimmed.slice(6);
+        if (!trimmed || !trimmed.startsWith('data:')) continue;
+        const dataStr = trimmed.replace(/^data:\s*/, '');
         if (dataStr === '[DONE]') break;
 
         try {

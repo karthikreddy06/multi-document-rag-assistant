@@ -70,6 +70,7 @@ class QueryAnalyzer:
 
     EXHAUSTIVE_INDICATORS = (
         r"\b(?:all|every|each|everything|entire|complete\s+list|whole|full\s+list|"
+        r"complete\s+summary|full\s+summary|entire\s+document|whole\s+document|"
         r"all\s+sections|all\s+items|all\s+entries|all\s+pages|all\s+of\s+the)\b"
     )
 
@@ -103,7 +104,9 @@ class QueryAnalyzer:
     PAGE_PATTERN = r"\b(?:page|pages|p\.)\s*(\d+)\b"
 
     SUMMARIZATION_PATTERNS = (
-        r"^(?:summarize|give\s+(?:me\s+)?a\s+summary\s+of|overview\s+of|briefly\s+describe)\b"
+        r"\b(?:summarize|summary\s+of|give\s+(?:me\s+)?(?:a\s+)?(?:full\s+|complete\s+|detailed\s+|brief\s+|comprehensive\s+)?summary\s+of|"
+        r"(?:complete|full|entire|detailed|comprehensive|brief|executive)\s+summary(?:\s+of)?|"
+        r"overview\s+of|briefly\s+describe|provide\s+(?:a\s+)?summary\s+of)\b"
     )
 
     SEARCH_PATTERNS = (

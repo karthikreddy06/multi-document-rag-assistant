@@ -155,10 +155,21 @@ class RetrievalPlanner:
         # 4. EXHAUSTIVE / DOCUMENT-WIDE STRATEGY
         # Only select DOCUMENT_WIDE if target document is specifically resolved or singular in scope
         if analysis.intent in (QueryIntent.EXHAUSTIVE, QueryIntent.SUMMARIZATION):
+            def _has_doc_constraint(filt: Optional[Dict[str, Any]]) -> bool:
+                if not filt:
+                    return False
+                if "filename" in filt or "document_id" in filt or "file_hash" in filt:
+                    return True
+                if "$and" in filt and isinstance(filt["$and"], list):
+                    return any(_has_doc_constraint(sub) for sub in filt["$and"])
+                if "$or" in filt and isinstance(filt["$or"], list):
+                    return any(_has_doc_constraint(sub) for sub in filt["$or"])
+                return False
+
             is_single_target = (
                 doc_resolution.is_strictly_targeted
                 or (target_docs and len(target_docs) == 1)
-                or (where and ("document_id" in where or "filename" in where))
+                or _has_doc_constraint(where)
             )
             if is_single_target:
                 return RetrievalPlan(

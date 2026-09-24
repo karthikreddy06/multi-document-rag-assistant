@@ -758,20 +758,27 @@ class HybridRetriever:
         raw_chunks: List[RetrievedChunk] = []
 
         try:
-            # If where_filter is specified, pull all chunks matching the filter
-            if plan.where_filter:
+            # Preserve user_id filter while scoping to target documents
+            where_to_use = plan.where_filter
+            if plan.target_documents:
+                doc_filenames = [d.filename for d in plan.target_documents if d.filename]
+                if doc_filenames:
+                    if len(doc_filenames) == 1:
+                        doc_cond = {"filename": doc_filenames[0]}
+                    else:
+                        doc_cond = {"$or": [{"filename": fn} for fn in doc_filenames]}
+                    if where_to_use:
+                        if "filename" not in str(where_to_use) and "document_id" not in str(where_to_use):
+                            if "$and" in where_to_use and isinstance(where_to_use["$and"], list):
+                                where_to_use = {"$and": [*where_to_use["$and"], doc_cond]}
+                            else:
+                                where_to_use = {"$and": [where_to_use, doc_cond]}
+                    else:
+                        where_to_use = doc_cond
+
+            if where_to_use:
                 res = self.vector_store.collection.get(
-                    where=plan.where_filter,
-                    include=["metadatas", "documents"],
-                )
-            elif plan.target_documents:
-                doc_filenames = [d.filename for d in plan.target_documents]
-                if len(doc_filenames) == 1:
-                    where_cond = {"filename": doc_filenames[0]}
-                else:
-                    where_cond = {"$or": [{"filename": fn} for fn in doc_filenames]}
-                res = self.vector_store.collection.get(
-                    where=where_cond,
+                    where=where_to_use,
                     include=["metadatas", "documents"],
                 )
             else:

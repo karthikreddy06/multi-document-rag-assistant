@@ -82,9 +82,13 @@ class DocumentResolver:
         q_clean = re.sub(r"[^\w\s\.-]", " ", q_lower)
         q_tokens = [w for w in q_clean.split() if w not in cls.STOPWORDS]
 
-        # 1. Check singular document context: "this document", "the pdf", "this file"
+        # 1. Check singular document context: "this document", "the pdf", "this file", "the uploaded resume", etc.
         has_singular_doc_ref = bool(
-            re.search(r"\b(?:this\s+document|this\s+pdf|this\s+file|the\s+document|the\s+pdf|the\s+file)\b", q_lower)
+            re.search(
+                r"\b(?:this|the|that|my)\s+(?:uploaded\s+|attached\s+)?(?:document|pdf|file|resume|cv|report|paper|guide|notes?|doc)\b"
+                r"|\b(?:the\s+uploaded|the\s+attached)\b",
+                q_lower,
+            )
         )
 
         if len(available_documents) == 1 and (has_singular_doc_ref or not is_comparison):

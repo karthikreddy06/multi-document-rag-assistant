@@ -175,13 +175,15 @@ class LLMGenerator:
             if self.provider == "cloud" or "googleapis" in self.api_url:
                 headers["x-goog-api-key"] = self.api_key
 
-        max_tokens = num_predict if num_predict is not None else self.num_predict
+        max_tokens = max(num_predict if num_predict is not None else self.num_predict, 1024)
         payload = {
             "model": self.model,
             "messages": [{"role": "user", "content": prompt}],
             "temperature": self.temperature,
             "max_tokens": max_tokens,
         }
+        if self.provider == "groq" or "groq.com" in self.api_url:
+            payload["reasoning_format"] = "hidden"
 
         with httpx.Client(timeout=self.timeout) as http_client:
             resp = http_client.post(url, headers=headers, json=payload)
@@ -213,7 +215,7 @@ class LLMGenerator:
             if self.provider == "cloud" or "googleapis" in self.api_url:
                 headers["x-goog-api-key"] = self.api_key
 
-        max_tokens = num_predict if num_predict is not None else self.num_predict
+        max_tokens = max(num_predict if num_predict is not None else self.num_predict, 1024)
         payload = {
             "model": self.model,
             "messages": [{"role": "user", "content": prompt}],
@@ -221,16 +223,20 @@ class LLMGenerator:
             "max_tokens": max_tokens,
             "stream": True,
         }
+        if self.provider == "groq" or "groq.com" in self.api_url:
+            payload["reasoning_format"] = "hidden"
 
+        yielded_any = False
         with httpx.Client(timeout=self.timeout) as http_client:
             with http_client.stream("POST", url, headers=headers, json=payload) as response:
                 response.raise_for_status()
                 for line in response.iter_lines():
                     if not line:
                         continue
-                    line_str = line.strip()
-                    if line_str.startswith("data: "):
-                        data_part = line_str[6:].strip()
+                    line_str = line.decode("utf-8") if isinstance(line, bytes) else str(line)
+                    line_str = line_str.strip()
+                    if line_str.startswith("data:"):
+                        data_part = line_str[5:].strip()
                         if data_part == "[DONE]":
                             break
                         try:
@@ -242,9 +248,19 @@ class LLMGenerator:
                                 if not token and "text" in choices[0]:
                                     token = choices[0].get("text") or ""
                                 if token:
+                                    yielded_any = True
                                     yield token
                         except Exception:
                             continue
+
+        if not yielded_any:
+            logger.warning("Cloud stream completed with 0 tokens yielded. Attempting non-streaming fallback.")
+            try:
+                fallback_text = self._cloud_generate(prompt=prompt, num_predict=num_predict)
+                if fallback_text:
+                    yield fallback_text
+            except Exception as fb_e:
+                logger.error(f"Cloud stream non-streaming fallback failed: {fb_e}")
 
     def generate_answer(
         self,

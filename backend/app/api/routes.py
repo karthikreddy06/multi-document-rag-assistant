@@ -981,6 +981,27 @@ def chat_in_session_stream(
                 accumulated_tokens.append(token)
                 yield f"data: {json.dumps({'type': 'token', 'token': token})}\n\n"
 
+            if not accumulated_tokens:
+                logger.warning(f"generate_answer_stream yielded 0 tokens in chat '{chat_id}'. Attempting fallback generation.")
+                try:
+                    fallback_answer = rag_app.generator.generate_answer(
+                        question=effective_q,
+                        chunks=chunks,
+                        plan=plan,
+                        num_predict=plan.generation_budget.num_predict,
+                        num_ctx=plan.generation_budget.num_ctx,
+                    )
+                    if fallback_answer:
+                        accumulated_tokens.append(fallback_answer)
+                        yield f"data: {json.dumps({'type': 'token', 'token': fallback_answer})}\n\n"
+                except Exception as fb_err:
+                    logger.error(f"Fallback generation failed in chat '{chat_id}': {fb_err}")
+
+            if not accumulated_tokens:
+                default_msg = "I was unable to retrieve a response from the model. Please verify your query or document context."
+                accumulated_tokens.append(default_msg)
+                yield f"data: {json.dumps({'type': 'token', 'token': default_msg})}\n\n"
+
             full_answer = "".join(accumulated_tokens).strip()
             repository.create_message(chat_id=chat_id, role="user", content=query, user_id=user_id)
             sources_payload = [s.model_dump() for s in sources]
