@@ -366,7 +366,8 @@ class LLMGenerator:
                     effective_question = f"{effective_question} ({item_ref})"
 
         lines_per_doc = getattr(plan, "lines_per_doc", None) if plan else None
-        prompt = build_rag_prompt(effective_question, chunks, lines_per_doc=lines_per_doc)
+        is_summary_plan = bool(plan and getattr(plan, "strategy", None) in ("document_wide", "multi_document_summary"))
+        prompt = build_rag_prompt(effective_question, chunks, lines_per_doc=lines_per_doc, is_summary=is_summary_plan)
         pred = num_predict if num_predict is not None else self.num_predict
         ctx = num_ctx if num_ctx is not None else self.num_ctx
         logger.info(f"Generating answer using {self.model} ({self.provider}) with {len(chunks)} context chunks (num_predict={pred}, num_ctx={ctx})...")
@@ -511,7 +512,8 @@ class LLMGenerator:
                     effective_question = f"{effective_question} ({item_ref})"
 
         lines_per_doc = getattr(plan, "lines_per_doc", None) if plan else None
-        prompt = build_rag_prompt(effective_question, chunks, lines_per_doc=lines_per_doc)
+        is_summary_plan = bool(plan and getattr(plan, "strategy", None) in ("document_wide", "multi_document_summary"))
+        prompt = build_rag_prompt(effective_question, chunks, lines_per_doc=lines_per_doc, is_summary=is_summary_plan)
         pred = num_predict if num_predict is not None else self.num_predict
         ctx = num_ctx if num_ctx is not None else self.num_ctx
         logger.info(f"Streaming answer using {self.model} ({self.provider}) with {len(chunks)} context chunks (num_predict={pred}, num_ctx={ctx})...")

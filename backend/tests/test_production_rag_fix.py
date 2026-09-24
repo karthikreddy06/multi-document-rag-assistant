@@ -17,6 +17,7 @@ from fastapi.testclient import TestClient
 from app.api.routes import app
 from app.db import repository
 from app.generation.generator import LLMGenerator
+from app.generation.prompts import build_rag_prompt
 from app.models import RetrievedChunk
 from app.retrieval.document_resolver import DocumentResolver, ResolvedDocument
 from app.retrieval.planner import GenerationBudget, RetrievalPlan, RetrievalPlanner, RetrievalStrategy
@@ -341,3 +342,96 @@ def test_user_isolation_during_broad_document_wide_retrieval():
     # Verify all returned chunks strictly belong to user_a
     for c in chunks:
         assert c.metadata["user_id"] == "user_a"
+
+
+# ------------------------------------------------------------------------------
+# 5. Markdown Section Formatting & Grounding Rules
+# ------------------------------------------------------------------------------
+
+def test_markdown_section_formatting_prompt_directive():
+    """Verify that broad/summary queries include the Markdown section formatting directive."""
+    chunks = [
+        RetrievedChunk(text="Karthik Reddy\nPhone: +1-555-0199", metadata={"filename": "resume.pdf", "section": "Contact"}),
+        RetrievedChunk(text="Education: B.Tech CS", metadata={"filename": "resume.pdf", "section": "Education"}),
+    ]
+
+    prompt = build_rag_prompt("complete summary of the uploaded resume", chunks)
+
+    # Assert Markdown structure directives are present
+    assert "STRUCTURED MARKDOWN FORMATTING" in prompt
+    assert "DOCUMENT SUMMARY FORMATTING DIRECTIVE" in prompt
+    assert "## Heading" in prompt or "## Section Name" in prompt
+    assert "- **Field**: Value" in prompt
+    assert "### Item" in prompt
+    assert "Do NOT output a single compressed paragraph" in prompt
+
+
+def test_grounding_and_missing_information_instructions():
+    """Verify strict source-grounding instructions and exact missing-information wording."""
+    chunks = [
+        RetrievedChunk(text="Sample content", metadata={"filename": "doc.pdf"}),
+    ]
+
+    prompt = build_rag_prompt("What are the publications?", chunks)
+
+    # Assert exact grounding requirements
+    assert "Use ONLY information contained in the retrieved document context" in prompt
+    assert "Do not invent missing information" in prompt
+    assert "Not found in the provided document." in prompt
+    assert "Do not fabricate or hallucinate plausible details" in prompt
+    assert "Never expose or assume information from documents outside the provided context" in prompt
+
+
+def test_streaming_generation_preserves_markdown_sections():
+    """Verify streaming generation preserves Markdown headings, bullet points, and bold tags without corruption."""
+    generator = LLMGenerator(
+        provider="groq",
+        model="openai/gpt-oss-20b",
+        api_url="https://api.groq.com/openai/v1",
+        api_key="gsk_test_key",
+        num_predict=768,
+    )
+
+    markdown_chunks = [
+        "## Contact Information\n",
+        "- **Phone**: +1-555-0199\n",
+        "- **Email**: karthik@example.com\n\n",
+        "## Experience\n",
+        "### Backend Developer Intern\n",
+        "- Built async REST APIs using FastAPI\n\n",
+        "## Projects\n",
+        "### TravelTrack\n",
+        "- Real-time itinerary planning tool\n",
+    ]
+
+    def mock_cloud_stream(prompt, num_predict=None):
+        for piece in markdown_chunks:
+            yield piece
+
+    with patch.object(generator, "_cloud_generate_stream", side_effect=mock_cloud_stream):
+        tokens = list(generator.generate_answer_stream(
+            question="complete summary of the uploaded resume",
+            chunks=[RetrievedChunk(text="Karthik resume", metadata={"filename": "resume.pdf"})],
+        ))
+
+    full_output = "".join(tokens)
+
+    # Verify Markdown elements are preserved in the stream
+    assert "## Contact Information" in full_output
+    assert "- **Phone**: +1-555-0199" in full_output
+    assert "### Backend Developer Intern" in full_output
+    assert "### TravelTrack" in full_output
+
+
+def test_factual_query_prompt_is_clean_without_redundant_directives():
+    """Verify specific factual queries do not force full-document summary directive."""
+    chunks = [
+        RetrievedChunk(text="Graduation year: 2026", metadata={"filename": "resume.pdf"}),
+    ]
+
+    prompt = build_rag_prompt("What is the graduation year?", chunks)
+
+    # Core grounding is present, but document summary directive is not triggered
+    assert "STRICT GROUNDING" in prompt
+    assert "DOCUMENT SUMMARY FORMATTING DIRECTIVE" not in prompt
+
