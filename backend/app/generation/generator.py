@@ -117,14 +117,31 @@ class LLMGenerator:
         api_key: Optional[str] = None,
     ):
         self.provider = (provider or settings.llm_provider).lower()
-        self.model = model or settings.llm_model
+        if self.provider == "groq":
+            if model:
+                self.model = model
+            elif settings.llm_model != "llama3.2:1b":
+                self.model = settings.llm_model
+            else:
+                self.model = "openai/gpt-oss-20b"
+            self.api_url = api_url or settings.llm_api_url or "https://api.groq.com/openai/v1"
+        elif self.provider == "cloud":
+            if model:
+                self.model = model
+            elif settings.llm_model != "llama3.2:1b":
+                self.model = settings.llm_model
+            else:
+                self.model = "gemini-3.6-flash"
+            self.api_url = api_url or settings.llm_api_url or "https://generativelanguage.googleapis.com/v1beta/openai/"
+        else:
+            self.model = model or settings.llm_model
+            self.api_url = api_url or settings.llm_api_url
         self.host = host or settings.ollama_host
         self.temperature = temperature
         self.timeout = timeout or settings.ollama_timeout
         self.num_predict = num_predict if num_predict is not None else settings.llm_num_predict
         self.num_ctx = num_ctx if num_ctx is not None else settings.llm_num_ctx
-        self.api_url = api_url or settings.llm_api_url
-        self.api_key = api_key or settings.llm_api_key
+        self.api_key = api_key or settings.effective_llm_api_key
 
         if self.provider == "ollama":
             self.client = ollama.Client(host=self.host, timeout=self.timeout)
@@ -155,6 +172,8 @@ class LLMGenerator:
         }
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
+            if self.provider == "cloud" or "googleapis" in self.api_url:
+                headers["x-goog-api-key"] = self.api_key
 
         max_tokens = num_predict if num_predict is not None else self.num_predict
         payload = {
@@ -191,6 +210,8 @@ class LLMGenerator:
         }
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
+            if self.provider == "cloud" or "googleapis" in self.api_url:
+                headers["x-goog-api-key"] = self.api_key
 
         max_tokens = num_predict if num_predict is not None else self.num_predict
         payload = {
@@ -217,9 +238,9 @@ class LLMGenerator:
                             choices = parsed.get("choices", [])
                             if choices:
                                 delta = choices[0].get("delta", {})
-                                token = delta.get("content", "")
+                                token = delta.get("content") or ""
                                 if not token and "text" in choices[0]:
-                                    token = choices[0]["text"]
+                                    token = choices[0].get("text") or ""
                                 if token:
                                     yield token
                         except Exception:

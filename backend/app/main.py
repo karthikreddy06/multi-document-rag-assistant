@@ -24,15 +24,22 @@ class RAGApplication:
 
     def __init__(self, auto_ingest: bool = True):
         self.vector_store = VectorStore()
-        self.embedding_service = EmbeddingService()
+        self.embedding_service = EmbeddingService(
+            model=settings.effective_embedding_model,
+            provider=settings.embedding_provider,
+            dimensions=settings.effective_embedding_dimensions,
+        )
         self.retriever = HybridRetriever(
             vector_store=self.vector_store,
             embedding_service=self.embedding_service,
             top_k=settings.top_k,
         )
         self.generator = LLMGenerator(
-            model=settings.llm_model,
+            model=settings.effective_llm_model,
             host=settings.ollama_host,
+            provider=settings.llm_provider,
+            api_url=settings.effective_llm_api_url,
+            api_key=settings.effective_llm_api_key,
         )
         self.pipeline = IngestionPipeline(
             vector_store=self.vector_store,
@@ -49,8 +56,10 @@ class RAGApplication:
                 print("Ensure Ollama is running ('ollama serve') and models are pulled:\n")
                 print(f"  ollama pull {settings.embedding_model}")
                 print(f"  ollama pull {settings.llm_model}\n")
+            elif self.embedding_service.provider in ("local", "onnx"):
+                print(f"\n[WARNING] Could not initialize local CPU embedding model '{settings.effective_embedding_model}'.")
             else:
-                print(f"\n[WARNING] Could not verify cloud embedding service at {settings.embedding_api_url}.")
+                print(f"\n[WARNING] Could not verify cloud embedding service at {settings.effective_embedding_api_url}.")
             return False
         return True
 
@@ -176,6 +185,17 @@ def main():
 
     # Default: Interactive mode
     app.interactive_loop()
+
+
+def __getattr__(name: str):
+    """
+    Expose FastAPI 'app' from app.api.routes dynamically so
+    'uvicorn app.main:app' starts the production REST server cleanly.
+    """
+    if name == "app":
+        from app.api.routes import app as fastapi_app
+        return fastapi_app
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 if __name__ == "__main__":

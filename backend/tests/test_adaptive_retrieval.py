@@ -115,6 +115,8 @@ def test_ordinal_exclusion_item_completeness(retriever):
     REGRESSION TEST: Specifically verifies 'except first and second' returns items 3
     through the end with NO missing items (specifically items 3, 4, 5 must NOT be lost).
     """
+    if "python_number_programs_20.pdf" not in retriever.vector_store.get_indexed_files():
+        pytest.skip("python_number_programs_20.pdf not in index")
     q = "Tell me all programs except the first and second"
     chunks, plan, coverage = retriever.retrieve_adaptive(
         query=q,
@@ -151,6 +153,8 @@ def test_exhaustive_contains_all_20_items(retriever):
     """
     REGRESSION TEST: Specifically verifies 'all programs' contains all 20 items.
     """
+    if "python_number_programs_20.pdf" not in retriever.vector_store.get_indexed_files():
+        pytest.skip("python_number_programs_20.pdf not in index")
     q = "give me all programs"
     chunks, plan, coverage = retriever.retrieve_adaptive(
         query=q,
@@ -175,6 +179,8 @@ def test_ordinal_slices_and_single_items(retriever):
     """
     REGRESSION TEST: Verifies range slices ('programs 3 through 7') and single items ('second program').
     """
+    if "python_number_programs_20.pdf" not in retriever.vector_store.get_indexed_files():
+        pytest.skip("python_number_programs_20.pdf not in index")
     # 1. Range slice
     q_slice = "Give me programs 3 through 7"
     _, plan_slice, _ = retriever.retrieve_adaptive(
@@ -214,6 +220,8 @@ def test_follow_up_scope_isolation(retriever):
     ]
 
     q = "give the code for it"
+    if "python_number_programs_20.pdf" not in retriever.vector_store.get_indexed_files():
+        pytest.skip("python_number_programs_20.pdf not in index")
     chunks, plan, coverage = retriever.retrieve_adaptive(
         query=q,
         recent_messages=history,

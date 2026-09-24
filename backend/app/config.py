@@ -29,6 +29,10 @@ class Settings(BaseSettings):
     embedding_model: str = Field(default="nomic-embed-text", alias="EMBEDDING_MODEL")
     embedding_api_url: str = Field(default="", alias="EMBEDDING_API_URL")
     embedding_api_key: str = Field(default="", alias="EMBEDDING_API_KEY")
+    embedding_dimensions: int = Field(default=768, alias="EMBEDDING_DIMENSIONS")
+
+    groq_api_key: str = Field(default="", alias="GROQ_API_KEY")
+    gemini_api_key: str = Field(default="", alias="GEMINI_API_KEY")
 
     ollama_host: str = Field(default="http://localhost:11434", alias="OLLAMA_HOST")
     ollama_timeout: float = Field(default=180.0, alias="OLLAMA_TIMEOUT")
@@ -79,7 +83,7 @@ class Settings(BaseSettings):
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
 
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=(".env", str(_BACKEND_DIR / ".env")),
         env_file_encoding="utf-8",
         extra="ignore"
     )
@@ -99,6 +103,69 @@ class Settings(BaseSettings):
     @property
     def upload_abs_path(self) -> Path:
         return Path(self.upload_dir).resolve()
+
+    @property
+    def effective_llm_api_key(self) -> str:
+        p = self.llm_provider.lower()
+        if p == "groq":
+            return self.groq_api_key or self.llm_api_key
+        if p == "cloud":
+            return self.gemini_api_key or self.llm_api_key
+        return self.llm_api_key or self.groq_api_key or self.gemini_api_key
+
+    @property
+    def effective_embedding_api_key(self) -> str:
+        return self.embedding_api_key or self.gemini_api_key
+
+    @property
+    def effective_llm_api_url(self) -> str:
+        if self.llm_api_url:
+            return self.llm_api_url
+        p = self.llm_provider.lower()
+        if p == "groq":
+            return "https://api.groq.com/openai/v1"
+        if p == "cloud":
+            return "https://generativelanguage.googleapis.com/v1beta/openai/"
+        return ""
+
+    @property
+    def effective_embedding_api_url(self) -> str:
+        if self.embedding_api_url:
+            return self.embedding_api_url
+        if self.embedding_provider.lower() == "cloud":
+            return "https://generativelanguage.googleapis.com/v1beta/openai/"
+        return ""
+
+    @property
+    def effective_llm_model(self) -> str:
+        p = self.llm_provider.lower()
+        if p == "groq":
+            if self.llm_model and self.llm_model != "llama3.2:1b":
+                return self.llm_model
+            return "openai/gpt-oss-20b"
+        if p == "cloud" and self.llm_model == "llama3.2:1b":
+            return "gemini-3.6-flash"
+        return self.llm_model
+
+    @property
+    def effective_embedding_model(self) -> str:
+        p = self.embedding_provider.lower()
+        if p in ("local", "onnx"):
+            if self.embedding_model and self.embedding_model != "nomic-embed-text":
+                return self.embedding_model
+            return "all-MiniLM-L6-v2"
+        if p == "cloud" and self.embedding_model == "nomic-embed-text":
+            return "gemini-embedding-2"
+        return self.embedding_model
+
+    @property
+    def effective_embedding_dimensions(self) -> int:
+        p = self.embedding_provider.lower()
+        if p in ("local", "onnx"):
+            if self.embedding_dimensions != 768:
+                return self.embedding_dimensions
+            return 384
+        return self.embedding_dimensions
 
 
 settings = Settings()

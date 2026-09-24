@@ -288,58 +288,89 @@ python -m app.main --query "What is the primary methodology described in the doc
 ### Environment Modes
 
 - **LOCAL DEVELOPMENT** → Ollama + local models (`llama3.2:1b`, `nomic-embed-text`)
-- **PRODUCTION** → Cloud AI provider (e.g. Groq / OpenRouter / Gemini) + deployed FastAPI backend
+- **PRODUCTION DEPLOYMENT (ZERO PREPAID CREDITS)** → Groq API (`openai/gpt-oss-20b`) + Local CPU ONNX Embeddings (`all-MiniLM-L6-v2`) + Render Backend + Vercel Frontend
 
-### 1. Deployment Architecture Overview
-- **Frontend**: Vite React SPA hosted as a static site (e.g., Vercel, Netlify, Cloudflare Pages, or Render Static Site).
-- **Backend**: FastAPI Python application deployed as a web service (e.g., Render Web Service, Railway, Docker container, or VPS).
-- **LLM / Embedding Service**:
-  - *Local Mode*: Ollama running locally at `http://localhost:11434`.
-  - *Production Mode*: Configurable cloud AI provider API (e.g. Groq, OpenRouter, Google Gemini) via `LLM_PROVIDER=cloud` and `EMBEDDING_PROVIDER=cloud`.
+### 1. Production Architecture Overview
+- **Frontend**: React + Vite SPA deployed on **Vercel**.
+- **Backend**: FastAPI Python application deployed on **Render** (starts via `uvicorn app.main:app --host 0.0.0.0 --port $PORT`).
+- **LLM Provider**: **Groq API** (`https://api.groq.com/openai/v1`, model: `openai/gpt-oss-20b`). Uses free high-throughput inference (~14,400 requests/day free tier) with SSE streaming support.
+- **Embedding Provider**: **Local CPU ONNX** (`all-MiniLM-L6-v2`, 384 dimensions). Executes on CPU directly within the Render backend (~80MB model size, ~100MB RAM footprint). Requires zero external API credits and no GPU.
+- **Vector Database**: **ChromaDB** (embedded persistent vector store).
+- **Relational Database**: **SQLite** (`rag_app.db`).
+- **Local Development**: Completely preserved with Ollama (`LLM_PROVIDER=ollama`, `EMBEDDING_PROVIDER=ollama`).
 
-### 2. Required Environment Variables
+### 2. Groq API Key Setup
+1. Create a free account at [Groq Console](https://console.groq.com/keys).
+2. Generate an API Key (starts with `gsk_...`).
+3. Set in your environment:
+   - For local production testing: set `GROQ_API_KEY=gsk_...` in `backend/.env`.
+   - For Render: add `GROQ_API_KEY` under **Environment Variables** in the Render Dashboard.
+4. **Security Notice**: Never commit `backend/.env` to Git and never expose `GROQ_API_KEY` to the React frontend.
 
-#### Backend (`backend/.env`)
-| Variable | Description | Example / Default |
-|---|---|---|
-| `LLM_PROVIDER` | Provider for generation (`ollama` or `cloud`) | `ollama` |
-| `LLM_MODEL` | Model used for grounded answer generation | `llama3.2:1b` (local) / `llama-3.3-70b-versatile` (cloud) |
-| `LLM_API_URL` | Cloud LLM REST endpoint URL | `https://api.groq.com/openai/v1` |
-| `LLM_API_KEY` | API Key for Cloud LLM provider | `your_cloud_api_key` |
-| `EMBEDDING_PROVIDER` | Provider for embeddings (`ollama` or `cloud`) | `ollama` |
-| `EMBEDDING_MODEL` | Model used for dense vector embeddings | `nomic-embed-text` (local) / `text-embedding-004` (cloud) |
-| `EMBEDDING_API_URL` | Cloud Embedding REST endpoint URL | `https://generativelanguage.googleapis.com/v1beta/openai` |
-| `EMBEDDING_API_KEY` | API Key for Cloud Embedding provider | `your_cloud_api_key` |
-| `OLLAMA_HOST` | URL of local running Ollama instance | `http://localhost:11434` |
-| `OLLAMA_TIMEOUT` | Timeout in seconds for Ollama requests | `180.0` |
-| `CHROMA_PATH` | Directory for persistent ChromaDB storage | `./chroma_db` |
-| `DATABASE_PATH` | Path to SQLite database file | `./data/rag_app.db` |
-| `UPLOAD_DIR` | Directory where uploaded files are stored | `./data/uploads` |
-| `CORS_ORIGINS` | JSON list or comma-separated origins allowed for CORS | `["https://your-frontend.vercel.app"]` |
-| `PORT` | HTTP port for FastAPI/Uvicorn | `8000` |
+### 3. Deploying the Backend on Render
+1. Create a new **Web Service** on [Render](https://dashboard.render.com/) and connect your Git repository.
+2. Configure settings:
+   - **Root Directory**: `backend`
+   - **Runtime**: `Python 3`
+   - **Build Command**: `pip install -r requirements.txt`
+   - **Start Command**: `uvicorn app.main:app --host 0.0.0.0 --port $PORT`
+   - **Instance Type**: Free (512MB RAM, shared CPU)
+3. Set **Environment Variables** in Render:
+   | Key | Value |
+   |---|---|
+   | `LLM_PROVIDER` | `groq` |
+   | `GROQ_API_KEY` | `<your_groq_api_key>` |
+   | `LLM_API_URL` | `https://api.groq.com/openai/v1` |
+   | `LLM_MODEL` | `openai/gpt-oss-20b` |
+   | `EMBEDDING_PROVIDER` | `local` |
+   | `EMBEDDING_MODEL` | `all-MiniLM-L6-v2` |
+   | `EMBEDDING_DIMENSIONS` | `384` |
+   | `CORS_ORIGINS` | `["https://<your-vercel-app>.vercel.app","http://localhost:5173"]` |
+4. Deploy the service and copy your public Render service URL (e.g., `https://rag-backend-xxxx.onrender.com`).
 
-#### Frontend (`frontend/.env`)
-| Variable | Description | Example |
-|---|---|---|
-| `VITE_API_URL` | Public backend URL accessible from browser | `https://your-backend.onrender.com` |
+### 4. Deploying the Frontend on Vercel
+1. In the [Vercel Dashboard](https://vercel.com/), select **Add New Project** and import your Git repository.
+2. Configure settings:
+   - **Framework Preset**: `Vite`
+   - **Root Directory**: `frontend`
+   - **Build Command**: `npm run build`
+   - **Output Directory**: `dist`
+3. Add **Environment Variable**:
+   | Key | Value |
+   |---|---|
+   | `VITE_API_URL` | `https://<your-render-backend-url>.onrender.com` |
+4. Deploy. After deployment, update the `CORS_ORIGINS` variable on your Render backend with your actual Vercel domain.
 
-### 3. Production Backend Container Deployment (Docker)
-Build and run the backend Docker container:
-```bash
-docker build -t rag-backend ./backend
-docker run -d -p 8000:8000 \
-  -e OLLAMA_HOST="http://host.docker.internal:11434" \
-  -e CORS_ORIGINS='["https://your-frontend.vercel.app"]' \
-  rag-backend
+### 5. CORS Configuration
+To allow the browser to communicate from your Vercel frontend to the Render backend, the backend enforces Cross-Origin Resource Sharing (CORS).
+Configure `CORS_ORIGINS` in Render:
+```text
+CORS_ORIGINS=["https://my-rag-app.vercel.app","http://localhost:5173","http://localhost:3000"]
 ```
+Multiple origins can be passed as a JSON array or comma-separated strings.
 
-### 4. Ollama & Model Hosting Requirements
-- Ollama requires minimum 4GB RAM (8GB+ recommended) and CPU/GPU resources to load `llama3.2` and `nomic-embed-text`.
-- Standard free-tier serverless hostings (512MB RAM) cannot execute Ollama directly inside the backend container. Ollama must run on a cloud VM, GPU instance, or dedicated server with `OLLAMA_HOST` configured to point to it.
+### 6. Persistence & Storage Limitations on Render Free Tier
+- **Ephemeral Filesystem**: Render free tier instances operate on an ephemeral filesystem. When an instance spins down after 15 minutes of inactivity or is redeployed:
+  - Uploaded files in `data/uploads/` are reset.
+  - The SQLite database in `data/rag_app.db` is reset.
+  - ChromaDB vector data in `chroma_db/` is reset.
+- Documents committed into `documents/` inside the repository will automatically re-index on cold starts.
+- For permanent persistence of uploaded documents and chat histories across restarts, attach a **Render Persistent Disk** mounted to `/data` and `/chroma_db` (requires a paid Render instance).
 
-### 5. Persistent Storage & Cloud Limitations
-- SQLite database (`rag_app.db`), upload files (`/data/uploads`), and ChromaDB (`/chroma_db`) are stored on the filesystem.
-- On ephemeral container platforms (e.g. basic Render/Vercel free instances), attach persistent volume storage to `/app/data` and `/app/chroma_db` to retain chats, uploaded PDFs, and vector embeddings across container restarts.
+### 7. Reindexing After Changing Embedding Providers
+ChromaDB collections enforce a strict, uniform vector dimension across all stored embeddings:
+- `nomic-embed-text` / Gemini embeddings: **768 dimensions**
+- `all-MiniLM-L6-v2` local ONNX embeddings: **384 dimensions**
+
+If switching from Ollama/Gemini to the local CPU ONNX embedding provider, you **must re-index** your documents to clear the incompatible 768-dimensional collection and create a 384-dimensional collection.
+- **Via CLI**:
+  ```powershell
+  python -m app.main --reindex
+  ```
+- **Via REST API**:
+  ```bash
+  curl -X POST https://<your-render-backend>.onrender.com/api/reindex
+  ```
 
 ---
 
