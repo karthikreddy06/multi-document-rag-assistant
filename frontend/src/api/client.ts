@@ -74,11 +74,17 @@ export interface HealthResponse {
 }
 
 export interface DocumentInfo {
+  id?: string;
   filename: string;
+  file_type?: string;
+  file_size?: number;
   file_hash: string;
   chunk_count: number;
-  page_count: number;
+  page_count: number | null;
   sections: string[];
+  status?: string;
+  created_at?: string;
+  storage_path?: string | null;
 }
 
 export interface DocumentsResponse {
@@ -341,4 +347,82 @@ export const api = {
   // Message History
   listMessages: (chatId: string) =>
     fetchJson<ChatMessage[]>(`${API_BASE_URL}/api/chats/${chatId}/messages`),
+
+  // File Library View / Download / Delete
+  viewDocumentBlobUrl: async (documentId: string): Promise<string> => {
+    const response = await authenticatedFetch(`${API_BASE_URL}/api/documents/${documentId}/view`);
+    if (!response.ok) {
+      const msg = await parseResponseError(response, 'Failed to view document');
+      throw new Error(msg);
+    }
+    const blob = await response.blob();
+    return URL.createObjectURL(blob);
+  },
+
+  downloadDocument: async (documentId: string, filename: string): Promise<void> => {
+    const response = await authenticatedFetch(`${API_BASE_URL}/api/documents/${documentId}/download`);
+    if (!response.ok) {
+      const msg = await parseResponseError(response, 'Failed to download document');
+      throw new Error(msg);
+    }
+    const blob = await response.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  },
+
+  deleteDocument: async (documentId: string): Promise<void> => {
+    const response = await authenticatedFetch(`${API_BASE_URL}/api/documents/${documentId}`, {
+      method: 'DELETE',
+    });
+    if (!response.ok) {
+      const msg = await parseResponseError(response, 'Failed to delete document');
+      throw new Error(msg);
+    }
+  },
+
+  attachDocumentToChat: (chatId: string, documentId: string) =>
+    fetchJson<DocumentRecord>(`${API_BASE_URL}/api/chats/${chatId}/documents/${documentId}`, {
+      method: 'POST',
+    }),
+
+  // File Conversion
+  getConversionTargets: (documentId: string) =>
+    fetchJson<{ document_id: string; filename: string; current_format: string; supported_targets: string[] }>(
+      `${API_BASE_URL}/api/documents/${documentId}/convert/targets`
+    ),
+
+  convertDocument: async (documentId: string, targetFormat: string, fallbackFilename: string): Promise<void> => {
+    const response = await authenticatedFetch(`${API_BASE_URL}/api/documents/${documentId}/convert`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ target_format: targetFormat }),
+    });
+    if (!response.ok) {
+      const msg = await parseResponseError(response, 'Failed to convert document');
+      throw new Error(msg);
+    }
+    const disposition = response.headers.get('Content-Disposition') || '';
+    let filename = fallbackFilename;
+    const match = disposition.match(/filename="?([^";]+)"?/i);
+    if (match && match[1]) {
+      filename = match[1].trim();
+    }
+    const blob = await response.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  },
 };

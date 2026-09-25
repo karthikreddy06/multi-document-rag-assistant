@@ -2,7 +2,7 @@
 Database package for persistent SQLite storage of chats, documents, and messages.
 """
 
-from app.db.database import get_db_connection, init_db
+from app.db.database import get_db_connection, init_db, get_pg_pool, close_db
 from app.db.repository import (
     create_chat,
     list_chats,
@@ -25,6 +25,8 @@ from app.db.repository import (
 __all__ = [
     "get_db_connection",
     "init_db",
+    "get_pg_pool",
+    "close_db",
     "create_chat",
     "list_chats",
     "get_chat",

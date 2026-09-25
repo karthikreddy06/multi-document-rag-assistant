@@ -33,6 +33,7 @@ def isolation_env(tmp_path, monkeypatch):
     test_chroma = tmp_path / "test_chroma"
     test_chroma.mkdir(parents=True, exist_ok=True)
 
+    monkeypatch.setattr(settings, "database_url", None)
     init_db(test_db)
 
     # Monkeypatch database connection

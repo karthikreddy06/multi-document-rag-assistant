@@ -65,6 +65,14 @@ class UserLoginRequest(BaseModel):
             raise ValueError("Invalid email format.")
         return trimmed
 
+    @field_validator("password")
+    @classmethod
+    def validate_login_password(cls, v: str) -> str:
+        trimmed = v.strip()
+        if not trimmed:
+            raise ValueError("Password cannot be empty.")
+        return trimmed
+
 
 
 class UserResponse(BaseModel):
@@ -154,7 +162,8 @@ def register_user(request: UserRegisterRequest) -> UserResponse:
         )
 
     try:
-        pw_hash = hash_password(request.password)
+        clean_password = request.password.strip()
+        pw_hash = hash_password(clean_password)
         user_record = repository.create_user(
             email=clean_email,
             password_hash=pw_hash,
@@ -184,10 +193,11 @@ def login_user(request: UserLoginRequest) -> TokenResponse:
     Authenticate user credentials and return a signed JWT access token.
     """
     clean_email = request.email.strip().lower()
+    clean_password = request.password.strip()
     user_record = repository.get_user_by_email(clean_email)
 
     # Use constant-time or safe comparison, do not leak user existence
-    if not user_record or not verify_password(request.password, user_record.get("password_hash", "")):
+    if not user_record or not verify_password(clean_password, user_record.get("password_hash", "")):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Incorrect email or password.",

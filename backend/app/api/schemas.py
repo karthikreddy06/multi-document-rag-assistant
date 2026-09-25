@@ -70,12 +70,18 @@ class ChatResponse(BaseModel):
 
 
 class DocumentInfo(BaseModel):
-    """Summary metadata for an indexed document."""
+    """Summary metadata for an indexed document in the file library."""
+    id: Optional[str] = Field(None, description="Unique document ID")
     filename: str = Field(..., description="Filename of the document")
+    file_type: Optional[str] = Field(None, description="Derived file type or extension")
+    file_size: Optional[int] = Field(None, description="File size in bytes")
     file_hash: Optional[str] = Field(None, description="SHA-256 content hash")
     chunk_count: int = Field(default=0, description="Number of indexed chunks")
     page_count: Optional[int] = Field(None, description="Total pages in document if available")
     sections: List[str] = Field(default_factory=list, description="Extracted section titles")
+    status: Optional[str] = Field(default="ready", description="Document status")
+    created_at: Optional[str] = Field(None, description="Upload timestamp in UTC ISO-8601")
+    storage_path: Optional[str] = Field(None, description="Safe storage path")
 
 
 class DocumentsResponse(BaseModel):
@@ -130,4 +136,16 @@ class ChatMessageResponse(BaseModel):
     content: str = Field(..., description="Message text content")
     sources: List[SourceChunk] = Field(default_factory=list, description="Source provenance chunks for assistant responses")
     created_at: str = Field(..., description="Message creation timestamp in UTC ISO-8601")
+
+
+class ConversionRequest(BaseModel):
+    """Payload to request format conversion of a stored document."""
+    target_format: str = Field(..., description="Desired target extension (e.g. xlsx, csv, docx, pdf)")
+
+
+class ConversionTargetsResponse(BaseModel):
+    """Supported conversion targets for a document."""
+    source_format: str
+    supported_targets: List[str]
+
 

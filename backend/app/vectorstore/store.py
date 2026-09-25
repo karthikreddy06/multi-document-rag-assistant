@@ -27,6 +27,22 @@ logger = setup_logger("vectorstore.store")
 
 
 class VectorStore:
+    """Vector store abstraction routing to PgVectorStore (production) or ChromaVectorStore (local)."""
+
+    def __new__(
+        cls,
+        persist_path: Optional[str] = None,
+        collection_name: Optional[str] = None,
+    ):
+        if cls is VectorStore:
+            if settings.is_pgvector:
+                from app.vectorstore.pgvector_store import PgVectorStore
+                return PgVectorStore()
+            return ChromaVectorStore(persist_path=persist_path, collection_name=collection_name)
+        return super().__new__(cls)
+
+
+class ChromaVectorStore(VectorStore):
     """Production ChromaDB client supporting idempotent chunk upserts and metadata filtering."""
 
     def __init__(
@@ -185,6 +201,22 @@ class VectorStore:
     def get_all(self) -> Dict[str, Any]:
         """Retrieve all documents and metadata stored in the collection."""
         return self.collection.get()
+
+    def get(
+        self,
+        where: Optional[Dict[str, Any]] = None,
+        include: Optional[List[str]] = None,
+        limit: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Retrieve documents and metadata stored in the collection matching filters."""
+        kwargs: Dict[str, Any] = {}
+        if where:
+            kwargs["where"] = where
+        if include:
+            kwargs["include"] = include
+        if limit is not None:
+            kwargs["limit"] = limit
+        return self.collection.get(**kwargs)
 
     def delete_by_filename(self, filename: str, user_id: Optional[str] = None) -> int:
         """

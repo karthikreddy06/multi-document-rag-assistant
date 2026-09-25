@@ -71,3 +71,9 @@ documents/company.pdf
 backend/documents/company.pdf
 **/documents/company.pdf
 
+# Frontend build & dependencies
+node_modules/
+**/node_modules/
+dist/
+**/dist/
+

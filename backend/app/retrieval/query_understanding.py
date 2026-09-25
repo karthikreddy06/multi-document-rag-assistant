@@ -74,6 +74,16 @@ class QueryAnalyzer:
         r"all\s+sections|all\s+items|all\s+entries|all\s+pages|all\s+of\s+the)\b"
     )
 
+    DOCUMENT_WIDE_PATTERNS = (
+        r"\b(?:"
+        r"(?:explain|describe|summarize|walk\s+(?:me\s+)?through|give\s+(?:me\s+)?(?:a\s+)?(?:complete|full))\s+.*?\b(?:completely|thoroughly|in\s+detail|in\s+full|entirely|comprehensively)\b|"
+        r"(?:explain|describe|summarize|walk\s+(?:me\s+)?through|tell\s+me)\s+(?:about\s+)?(?:the\s+|this\s+|that\s+)?(?:whole|entire)\s+(?:document|pdf|file|paper|report|guide)\b|"
+        r"(?:explain|tell\s+me|summarize)\s+(?:about\s+)?everything\b|"
+        r"(?:complete|full)\s+explanation\b|"
+        r"explain\s+(?:it|this|the\s+(?:document|pdf|file))\s+(?:completely|thoroughly|in\s+full|in\s+detail)\b"
+        r")"
+    )
+
     COMPARISON_PREFIXES = (
         r"^(?:what\s+is\s+the\s+difference\s+between|"
         r"what\s+are\s+the\s+differences\s+between|"
@@ -282,8 +292,8 @@ class QueryAnalyzer:
                 is_table_request=is_table,
             )
 
-        # Step 6: Check exhaustive / document-wide questions ("all", "every", "complete list")
-        if re.search(cls.EXHAUSTIVE_INDICATORS, q_lower):
+        # Step 6: Check exhaustive / document-wide questions ("all", "every", "complete list", "explain the pdf completely")
+        if re.search(cls.DOCUMENT_WIDE_PATTERNS, q_lower) or re.search(cls.EXHAUSTIVE_INDICATORS, q_lower):
             aspects = cls._extract_exhaustive_aspects(clean_q)
             return QueryAnalysis(
                 raw_query=query,

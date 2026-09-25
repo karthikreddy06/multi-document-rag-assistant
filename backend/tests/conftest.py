@@ -11,6 +11,7 @@ import pytest
 
 from app.api.routes import app
 from app.api.auth import get_current_user, get_current_user_id
+from app.config import settings
 
 # If CHROMA_PATH is not explicitly set, default to chroma_db at repository root
 if "CHROMA_PATH" not in os.environ:
@@ -21,6 +22,20 @@ if "CHROMA_PATH" not in os.environ:
 
 
 @pytest.fixture(autouse=True)
+def default_sqlite_for_tests(monkeypatch, request):
+    """
+    By default in unit test suites, ensure tests run against local SQLite
+    unless the test specifically targets PostgreSQL/Supabase/pgvector.
+    """
+    mod_name = request.module.__name__
+    if any(k in mod_name for k in ("postgres", "pgvector", "supabase")):
+        yield
+        return
+    monkeypatch.setattr(settings, "database_url", None)
+    yield
+
+
+@pytest.fixture(autouse=True)
 def auto_auth_for_legacy_tests(request):
     """
     Automatically provide legacy_user authentication for existing legacy tests
@@ -28,7 +43,7 @@ def auto_auth_for_legacy_tests(request):
     test_user_isolation run against the real JWT authentication layer.
     """
     mod_name = request.module.__name__
-    if "test_auth" in mod_name or "test_user_isolation" in mod_name or "frontend_auth" in mod_name:
+    if any(k in mod_name for k in ("test_auth", "test_user_isolation", "frontend_auth", "persistence", "file_library", "conversion", "smoke")):
         yield
         return
 

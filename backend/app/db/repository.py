@@ -1,6 +1,7 @@
 """
 Database Repository Module.
 Provides CRUD operations for chats, documents, chat-document links, and messages.
+Supports dual database backends: PostgreSQL (production/Supabase) and SQLite (local/tests).
 All database access uses parameterized SQL and consistent UTC ISO-8601 timestamps.
 """
 
@@ -8,11 +9,13 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 import json
 from pathlib import Path
+import re
 import sqlite3
 from typing import Any, Dict, Generator, List, Optional
 import uuid
 
-from app.db.database import get_db_connection
+from app.config import settings
+from app.db.database import get_db_connection, get_pg_pool
 
 
 def _now_utc_iso() -> str:
@@ -20,36 +23,147 @@ def _now_utc_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _row_to_dict(row: Optional[sqlite3.Row]) -> Optional[Dict[str, Any]]:
-    """Convert an sqlite3.Row object to a standard Python dictionary."""
+def _translate_query(sql: str, is_postgres: bool) -> str:
+    """
+    Translate SQL statements between SQLite and PostgreSQL dialects safely.
+    - Parameter placeholders: ? -> %s
+    - Case-insensitive comparison: removes SQLite COLLATE NOCASE (PostgreSQL uses CITEXT)
+    - Conflict handling: translates INSERT OR IGNORE to ON CONFLICT DO NOTHING
+    - Native JSONB: casts sources_json placeholder in message inserts to %s::jsonb
+    """
+    if not is_postgres:
+        return sql
+
+    translated = sql
+
+    # 1. Translate INSERT OR IGNORE to PostgreSQL ON CONFLICT DO NOTHING
+    if re.search(r"INSERT\s+OR\s+IGNORE\s+INTO\s+chat_documents", translated, flags=re.IGNORECASE):
+        translated = re.sub(
+            r"INSERT\s+OR\s+IGNORE\s+INTO\s+chat_documents\s*\((.*?)\)\s*VALUES\s*\((.*?)\)",
+            r"INSERT INTO chat_documents (\1) VALUES (\2) ON CONFLICT (chat_id, document_id) DO NOTHING",
+            translated,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+    elif re.search(r"INSERT\s+OR\s+IGNORE\s+INTO\s+users", translated, flags=re.IGNORECASE):
+        translated = re.sub(
+            r"INSERT\s+OR\s+IGNORE\s+INTO\s+users\s*\((.*?)\)\s*VALUES\s*\((.*?)\)",
+            r"INSERT INTO users (\1) VALUES (\2) ON CONFLICT (id) DO NOTHING",
+            translated,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+
+    # 2. Remove SQLite-specific COLLATE NOCASE (PostgreSQL uses CITEXT for case-insensitive emails)
+    translated = re.sub(r"\s+COLLATE\s+NOCASE", "", translated, flags=re.IGNORECASE)
+
+    # 3. Explicit JSONB cast for messages sources_json column
+    if re.search(r"INSERT\s+INTO\s+messages", translated, flags=re.IGNORECASE):
+        translated = re.sub(
+            r"VALUES\s*\(\s*\?,\s*\?,\s*\?,\s*\?,\s*\?,\s*\?\s*\)",
+            r"VALUES (%s, %s, %s, %s, %s::jsonb, %s)",
+            translated,
+            flags=re.IGNORECASE,
+        )
+
+    # 4. Convert parameter placeholders: ? -> %s
+    translated = translated.replace("?", "%s")
+
+    return translated
+
+
+class DBConnectionWrapper:
+    """
+    Lightweight wrapper providing cross-engine database execution.
+    Transparently adapts parameter binding (? -> %s), dialect differences,
+    and returns cursor results compatible with dictionary row factories.
+    """
+
+    def __init__(self, raw_conn: Any, is_postgres: Optional[bool] = None):
+        self.raw_conn = raw_conn
+        if is_postgres is not None:
+            self.is_postgres = is_postgres
+        elif isinstance(raw_conn, sqlite3.Connection):
+            self.is_postgres = False
+        else:
+            self.is_postgres = getattr(settings, "is_postgres", False) or type(raw_conn).__module__.startswith("psycopg")
+
+    def execute(self, sql: str, params: tuple | list = ()):
+        translated_sql = _translate_query(sql, self.is_postgres)
+        if params is None:
+            params = ()
+        elif not isinstance(params, (tuple, list)):
+            params = tuple(params)
+        return self.raw_conn.execute(translated_sql, params)
+
+    def commit(self):
+        if hasattr(self.raw_conn, "commit"):
+            self.raw_conn.commit()
+
+    def rollback(self):
+        if hasattr(self.raw_conn, "rollback"):
+            self.raw_conn.rollback()
+
+    def close(self):
+        if hasattr(self.raw_conn, "close"):
+            self.raw_conn.close()
+
+    def __getattr__(self, item):
+        return getattr(self.raw_conn, item)
+
+
+def _row_to_dict(row: Optional[Any]) -> Optional[Dict[str, Any]]:
+    """
+    Convert a database row (sqlite3.Row or psycopg dict) to a standard Python dictionary.
+    Normalizes timestamps to ISO-8601 strings and sources_json to JSON strings for API consistency.
+    """
     if row is None:
         return None
-    return dict(row)
+    d = dict(row)
+    for k, v in d.items():
+        if isinstance(v, datetime):
+            d[k] = v.isoformat()
+        elif k == "sources_json" and isinstance(v, (dict, list)):
+            d[k] = json.dumps(v)
+    return d
 
 
-def _rows_to_dicts(rows: List[sqlite3.Row]) -> List[Dict[str, Any]]:
-    """Convert a list of sqlite3.Row objects to standard Python dictionaries."""
-    return [dict(r) for r in rows]
+def _rows_to_dicts(rows: List[Any]) -> List[Dict[str, Any]]:
+    """Convert a list of database rows to standard Python dictionaries."""
+    return [_row_to_dict(r) for r in rows if r is not None]
 
 
 @contextmanager
 def _managed_connection(
-    conn: Optional[sqlite3.Connection] = None,
+    conn: Optional[Any] = None,
     custom_path: Optional[str | Path] = None,
-) -> Generator[sqlite3.Connection, None, None]:
+) -> Generator[DBConnectionWrapper, None, None]:
     """
-    Yield an active SQLite connection.
-    If a connection is provided, reuse it without closing; otherwise open, commit, and close.
+    Yield an active database connection wrapped for cross-engine compatibility.
+    - If conn is provided, wrap and yield without closing (caller manages lifetime).
+    - If conn is None and SQLite mode (default / no DATABASE_URL): open, commit, and close.
+    - If conn is None and PostgreSQL mode (DATABASE_URL set): borrow from ConnectionPool with transaction.
     """
     if conn is not None:
-        yield conn
+        if isinstance(conn, DBConnectionWrapper):
+            yield conn
+        else:
+            yield DBConnectionWrapper(conn)
     else:
-        new_conn = get_db_connection(custom_path)
-        try:
-            yield new_conn
-            new_conn.commit()
-        finally:
-            new_conn.close()
+        if custom_path is not None or not settings.is_postgres:
+            new_conn = get_db_connection(custom_path)
+            wrapper = DBConnectionWrapper(new_conn, is_postgres=False)
+            try:
+                yield wrapper
+                new_conn.commit()
+            except Exception:
+                new_conn.rollback()
+                raise
+            finally:
+                new_conn.close()
+        else:
+            pool = get_pg_pool()
+            with pool.connection() as pg_conn:
+                wrapper = DBConnectionWrapper(pg_conn, is_postgres=True)
+                yield wrapper
 
 
 # ==============================================================================
@@ -60,7 +174,7 @@ def create_user(
     email: str,
     password_hash: str,
     user_id: Optional[str] = None,
-    conn: Optional[sqlite3.Connection] = None,
+    conn: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """Create a new user with normalized email and password hash."""
     clean_email = email.strip().lower()
@@ -83,7 +197,7 @@ def create_user(
 
 def get_user_by_email(
     email: str,
-    conn: Optional[sqlite3.Connection] = None,
+    conn: Optional[Any] = None,
 ) -> Optional[Dict[str, Any]]:
     """Retrieve user record by email address (case-insensitive)."""
     clean_email = email.strip().lower()
@@ -94,7 +208,7 @@ def get_user_by_email(
 
 def get_user_by_id(
     user_id: str,
-    conn: Optional[sqlite3.Connection] = None,
+    conn: Optional[Any] = None,
 ) -> Optional[Dict[str, Any]]:
     """Retrieve user record by user ID."""
     with _managed_connection(conn) as c:
@@ -102,7 +216,7 @@ def get_user_by_id(
         return _row_to_dict(row)
 
 
-def list_users(conn: Optional[sqlite3.Connection] = None) -> List[Dict[str, Any]]:
+def list_users(conn: Optional[Any] = None) -> List[Dict[str, Any]]:
     """List all registered users ordered by registration date."""
     with _managed_connection(conn) as c:
         rows = c.execute("SELECT * FROM users ORDER BY created_at ASC").fetchall()
@@ -117,7 +231,7 @@ def create_chat(
     title: str = "New Chat",
     user_id: Optional[str] = None,
     chat_id: Optional[str] = None,
-    conn: Optional[sqlite3.Connection] = None,
+    conn: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """Create a new chat session bound to a user (defaults to legacy_user)."""
     cid = chat_id or f"chat_{uuid.uuid4().hex[:16]}"
@@ -134,10 +248,9 @@ def create_chat(
         return _row_to_dict(row) or {}
 
 
-
 def list_chats(
     user_id: Optional[str] = None,
-    conn: Optional[sqlite3.Connection] = None,
+    conn: Optional[Any] = None,
 ) -> List[Dict[str, Any]]:
     """List all chats ordered by most recently updated, scoped by user_id if provided."""
     with _managed_connection(conn) as c:
@@ -156,7 +269,7 @@ def list_chats(
 def get_chat(
     chat_id: str,
     user_id: Optional[str] = None,
-    conn: Optional[sqlite3.Connection] = None,
+    conn: Optional[Any] = None,
 ) -> Optional[Dict[str, Any]]:
     """Retrieve a single chat by ID, verifying user_id ownership if provided."""
     with _managed_connection(conn) as c:
@@ -174,7 +287,7 @@ def rename_chat(
     chat_id: str,
     new_title: str,
     user_id: Optional[str] = None,
-    conn: Optional[sqlite3.Connection] = None,
+    conn: Optional[Any] = None,
 ) -> Optional[Dict[str, Any]]:
     """Rename an existing chat and update its updated_at timestamp, scoped by user_id if provided."""
     clean_title = new_title.strip()
@@ -205,7 +318,7 @@ def rename_chat(
 def delete_chat(
     chat_id: str,
     user_id: Optional[str] = None,
-    conn: Optional[sqlite3.Connection] = None,
+    conn: Optional[Any] = None,
 ) -> bool:
     """
     Delete a chat. Cascades automatically to messages and chat_documents links.
@@ -237,7 +350,7 @@ def create_document(
     status: str = "pending",
     error_message: Optional[str] = None,
     document_id: Optional[str] = None,
-    conn: Optional[sqlite3.Connection] = None,
+    conn: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """
     Register a document in the documents catalog.
@@ -279,7 +392,7 @@ def create_document(
 def get_document_by_id(
     document_id: str,
     user_id: Optional[str] = None,
-    conn: Optional[sqlite3.Connection] = None,
+    conn: Optional[Any] = None,
 ) -> Optional[Dict[str, Any]]:
     """Retrieve document record by document ID, scoped by user_id if provided."""
     with _managed_connection(conn) as c:
@@ -296,7 +409,7 @@ def get_document_by_id(
 def get_document_by_hash(
     file_hash: str,
     user_id: Optional[str] = None,
-    conn: Optional[sqlite3.Connection] = None,
+    conn: Optional[Any] = None,
 ) -> Optional[Dict[str, Any]]:
     """Retrieve document record by SHA-256 file content hash scoped by user_id."""
     with _managed_connection(conn) as c:
@@ -318,7 +431,7 @@ def update_document_status(
     error_message: Optional[str] = None,
     storage_path: Optional[str] = None,
     user_id: Optional[str] = None,
-    conn: Optional[sqlite3.Connection] = None,
+    conn: Optional[Any] = None,
 ) -> Optional[Dict[str, Any]]:
     """Update processing status, counts, and error details of an indexed document."""
     if status not in VALID_DOCUMENT_STATUSES:
@@ -361,7 +474,7 @@ def update_document_status(
 
 def list_documents(
     user_id: Optional[str] = None,
-    conn: Optional[sqlite3.Connection] = None,
+    conn: Optional[Any] = None,
 ) -> List[Dict[str, Any]]:
     """List all documents in the catalog ordered by creation date, scoped by user_id if provided."""
     with _managed_connection(conn) as c:
@@ -378,7 +491,7 @@ def list_documents(
 def delete_document(
     document_id: str,
     user_id: Optional[str] = None,
-    conn: Optional[sqlite3.Connection] = None,
+    conn: Optional[Any] = None,
 ) -> bool:
     """Delete a document record scoped by user_id if provided."""
     with _managed_connection(conn) as c:
@@ -397,7 +510,7 @@ def attach_document_to_chat(
     chat_id: str,
     document_id: str,
     user_id: Optional[str] = None,
-    conn: Optional[sqlite3.Connection] = None,
+    conn: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """
     Associate an existing document with a chat.
@@ -449,7 +562,7 @@ def detach_document_from_chat(
     chat_id: str,
     document_id: str,
     user_id: Optional[str] = None,
-    conn: Optional[sqlite3.Connection] = None,
+    conn: Optional[Any] = None,
 ) -> bool:
     """
     Remove a document from a chat's scope.
@@ -476,7 +589,7 @@ def detach_document_from_chat(
 def list_chat_documents(
     chat_id: str,
     user_id: Optional[str] = None,
-    conn: Optional[sqlite3.Connection] = None,
+    conn: Optional[Any] = None,
 ) -> List[Dict[str, Any]]:
     """
     List all documents attached to a specific chat, including document metadata.
@@ -516,7 +629,7 @@ def list_chat_documents(
 def document_attached_to_chat(
     chat_id: str,
     document_id: str,
-    conn: Optional[sqlite3.Connection] = None,
+    conn: Optional[Any] = None,
 ) -> bool:
     """Check if a specific document is attached to a chat."""
     with _managed_connection(conn) as c:
@@ -541,7 +654,7 @@ def create_message(
     sources_json: Optional[str | List[Dict[str, Any]]] = None,
     message_id: Optional[str] = None,
     user_id: Optional[str] = None,
-    conn: Optional[sqlite3.Connection] = None,
+    conn: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """
     Create and persist a chat message.
@@ -587,7 +700,7 @@ def create_message(
 def list_messages(
     chat_id: str,
     user_id: Optional[str] = None,
-    conn: Optional[sqlite3.Connection] = None,
+    conn: Optional[Any] = None,
 ) -> List[Dict[str, Any]]:
     """Retrieve all messages for a specific chat ordered chronologically, validating ownership if user_id is provided."""
     with _managed_connection(conn) as c:
@@ -601,4 +714,3 @@ def list_messages(
             (chat_id,),
         ).fetchall()
         return _rows_to_dicts(rows)
-

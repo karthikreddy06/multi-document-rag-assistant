@@ -6,6 +6,7 @@ with dynamic candidate depth, retrieval strategy, and adaptive generation budget
 
 from dataclasses import dataclass, field
 from enum import Enum
+import re
 from typing import Any, Dict, List, Optional
 
 from app.retrieval.query_understanding import QueryAnalysis, QueryIntent, OrdinalSpec
@@ -166,10 +167,18 @@ class RetrievalPlanner:
                     return any(_has_doc_constraint(sub) for sub in filt["$or"])
                 return False
 
+            is_broad_complete = bool(
+                re.search(
+                    r"\b(?:completely|thoroughly|whole|entire|everything|in\s+detail|in\s+full|complete\s+explanation|full\s+explanation)\b",
+                    query_text.lower(),
+                )
+            )
+
             is_single_target = (
                 doc_resolution.is_strictly_targeted
                 or (target_docs and len(target_docs) == 1)
                 or _has_doc_constraint(where)
+                or is_broad_complete
             )
             if is_single_target:
                 return RetrievalPlan(

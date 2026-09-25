@@ -15,10 +15,18 @@ from fastapi.responses import StreamingResponse
 
 from app.config import settings
 from app.ingestion.loader import FileTypeDetector
-from app.db import repository, init_db
+from app.db import repository, init_db, close_db
 from app.main import RAGApplication
 from app.models import RetrievedChunk
 from app.utils.logger import setup_logger
+from app.services.storage import get_storage_service
+from app.services.converter import (
+    DocumentConverter,
+    is_conversion_supported,
+    get_supported_targets,
+    UnsupportedConversionError,
+    MIME_TYPES,
+)
 from app.api.schemas import (
     HealthResponse,
     DocumentsResponse,
@@ -34,6 +42,8 @@ from app.api.schemas import (
     DocumentRecordResponse,
     DocumentUploadResponse,
     ChatMessageResponse,
+    ConversionRequest,
+    ConversionTargetsResponse,
 )
 from app.api.auth import router as auth_router, get_current_user, get_current_user_id
 
@@ -61,6 +71,12 @@ app.add_middleware(
 # Mount authentication router (Phase 2)
 app.include_router(auth_router)
 
+
+@app.on_event("shutdown")
+def on_shutdown() -> None:
+    """Safely release database pool connections on application shutdown."""
+    close_db()
+
 # Singleton container for RAGApplication
 _rag_app_instance: Optional[RAGApplication] = None
 
@@ -87,7 +103,57 @@ def health_check() -> HealthResponse:
 
 
 # ------------------------------------------------------------------------------
-# 2. Documents Metadata & Catalog Endpoints (User Scoped)
+# Helpers: Chat Auto-Titling & Document Storage Resolution
+# ------------------------------------------------------------------------------
+def generate_chat_title(query: str, max_words: int = 6) -> str:
+    """Generate a clean, deterministic short title from the user's first prompt."""
+    cleaned = re.sub(r"[^\w\s-]", "", query).strip()
+    words = cleaned.split()
+    if not words:
+        return "New Chat"
+    title = " ".join(words[:max_words]).strip()
+    return title[0].upper() + title[1:] if title else "New Chat"
+
+
+def _fetch_document_bytes(doc: Dict[str, Any], user_id: str) -> bytes:
+    """Safely retrieve original document content from persistent or local storage."""
+    storage = get_storage_service()
+    storage_path = doc.get("storage_path")
+    if storage_path:
+        try:
+            return storage.download(storage_path)
+        except Exception as e:
+            logger.warning(f"Could not download from storage_path '{storage_path}': {e}")
+
+    # Fallback to local uploads directory
+    fn = doc.get("filename", "")
+    fhash = doc.get("file_hash", "")
+    ext = Path(fn).suffix.lower()
+    upload_dir = settings.upload_abs_path
+    candidate_paths = [
+        upload_dir / f"{fhash}{ext}",
+        upload_dir / fn,
+        settings.upload_abs_path / "uploads" / f"{fhash}{ext}",
+        Path(settings.upload_dir) / f"{fhash}{ext}",
+        Path(settings.upload_dir) / fn,
+        Path(settings.documents_dir) / fn,
+    ]
+    for p in candidate_paths:
+        if p.exists() and p.is_file():
+            try:
+                with open(p, "rb") as f:
+                    return f.read()
+            except Exception:
+                pass
+
+    raise HTTPException(
+        status_code=status.HTTP_404_NOT_FOUND,
+        detail=f"Source file for document '{doc.get('id')}' is not available in storage.",
+    )
+
+
+# ------------------------------------------------------------------------------
+# 2. Documents Metadata & File Library Endpoints (User Scoped)
 # ------------------------------------------------------------------------------
 @app.get("/api/documents", response_model=DocumentsResponse, tags=["Documents"])
 def get_documents(
@@ -95,10 +161,42 @@ def get_documents(
     rag_app: RAGApplication = Depends(get_rag_app),
 ) -> DocumentsResponse:
     """
-    Return currently indexed documents and existing metadata strictly scoped to the authenticated user.
+    Return all documents in the user's file library and catalog,
+    with filename, file type, size, upload date, page count, and status.
     """
     user_id = str(current_user["id"])
     try:
+        db_docs = repository.list_documents(user_id=user_id)
+        if db_docs:
+            doc_list: List[DocumentInfo] = []
+            total_chunks = 0
+            for doc in db_docs:
+                chunks = doc.get("chunk_count") or 0
+                total_chunks += chunks
+                fn = doc.get("filename", "unknown")
+                ext = Path(fn).suffix.lower().lstrip(".")
+                doc_list.append(
+                    DocumentInfo(
+                        id=doc["id"],
+                        filename=fn,
+                        file_type=ext.upper() if ext else "FILE",
+                        file_size=doc.get("file_size"),
+                        file_hash=doc.get("file_hash"),
+                        chunk_count=chunks,
+                        page_count=doc.get("page_count"),
+                        sections=[],
+                        status=doc.get("status", "ready"),
+                        created_at=doc.get("created_at"),
+                        storage_path=doc.get("storage_path"),
+                    )
+                )
+            return DocumentsResponse(
+                total_documents=len(doc_list),
+                total_chunks=total_chunks,
+                documents=doc_list,
+            )
+
+        # Fallback to vector store for legacy documents
         indexed_map = rag_app.vector_store.get_indexed_files(user_id=user_id)
         raw = rag_app.vector_store.collection.get(
             where={"user_id": user_id},
@@ -122,6 +220,7 @@ def get_documents(
             fn = meta.get("filename", "unknown")
             if fn not in doc_stats:
                 doc_stats[fn] = {
+                    "id": meta.get("document_id"),
                     "filename": fn,
                     "file_hash": meta.get("file_hash") or indexed_map.get(fn),
                     "chunk_count": 0,
@@ -137,13 +236,17 @@ def get_documents(
 
         doc_list: List[DocumentInfo] = []
         for fn, info in sorted(doc_stats.items(), key=lambda x: x[0]):
+            ext = Path(fn).suffix.lower().lstrip(".")
             doc_list.append(
                 DocumentInfo(
+                    id=info.get("id"),
                     filename=info["filename"],
+                    file_type=ext.upper() if ext else "FILE",
                     file_hash=info["file_hash"],
                     chunk_count=info["chunk_count"],
                     page_count=len(info["pages"]) if info["pages"] else None,
                     sections=sorted(list(info["sections"]))[:10],
+                    status="ready",
                 )
             )
 
@@ -182,6 +285,70 @@ def get_document(
     return DocumentRecordResponse(**doc)
 
 
+@app.get("/api/documents/{document_id}/download", tags=["Documents"])
+def download_document(
+    document_id: str,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+) -> Response:
+    """
+    Download original file payload verifying user ownership.
+    """
+    user_id = str(current_user["id"])
+    doc = repository.get_document_by_id(document_id, user_id=user_id)
+    if not doc:
+        raise HTTPException(status_code=404, detail=f"Document '{document_id}' not found.")
+    data = _fetch_document_bytes(doc, user_id)
+    filename = doc.get("filename", "document")
+    return Response(
+        content=data,
+        media_type="application/octet-stream",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@app.get("/api/documents/{document_id}/view", tags=["Documents"])
+def view_document(
+    document_id: str,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+) -> Response:
+    """
+    View file content inline where browser supported (PDF, text, images).
+    Office documents (DOCX, XLSX, PPTX) return an attachment download.
+    """
+    user_id = str(current_user["id"])
+    doc = repository.get_document_by_id(document_id, user_id=user_id)
+    if not doc:
+        raise HTTPException(status_code=404, detail=f"Document '{document_id}' not found.")
+    data = _fetch_document_bytes(doc, user_id)
+    filename = doc.get("filename", "document")
+    ext = Path(filename).suffix.lower()
+
+    viewable_mimes = {
+        ".pdf": "application/pdf",
+        ".txt": "text/plain; charset=utf-8",
+        ".md": "text/plain; charset=utf-8",
+        ".markdown": "text/plain; charset=utf-8",
+        ".png": "image/png",
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".webp": "image/webp",
+        ".svg": "image/svg+xml",
+        ".csv": "text/plain; charset=utf-8",
+    }
+    if ext in viewable_mimes:
+        mime = viewable_mimes[ext]
+        disp = "inline"
+    else:
+        mime = "application/octet-stream"
+        disp = "attachment"
+
+    return Response(
+        content=data,
+        media_type=mime,
+        headers={"Content-Disposition": f'{disp}; filename="{filename}"'},
+    )
+
+
 @app.delete(
     "/api/documents/{document_id}",
     status_code=status.HTTP_204_NO_CONTENT,
@@ -193,7 +360,7 @@ def delete_document(
     rag_app: RAGApplication = Depends(get_rag_app),
 ) -> Response:
     """
-    Delete a document record and its associated ChromaDB chunks, verifying ownership.
+    Delete a document record, physical/cloud storage file, and associated vector chunks.
     """
     user_id = str(current_user["id"])
     doc = repository.get_document_by_id(document_id, user_id=user_id)
@@ -203,6 +370,15 @@ def delete_document(
             detail=f"Document '{document_id}' not found.",
         )
 
+    # 1. Clean up storage object
+    storage_path = doc.get("storage_path")
+    if storage_path:
+        try:
+            get_storage_service().delete(storage_path)
+        except Exception as e:
+            logger.warning(f"Failed to delete storage file '{storage_path}': {e}")
+
+    # 2. Delete database row (cascades to junction tables)
     deleted = repository.delete_document(document_id, user_id=user_id)
     if not deleted:
         raise HTTPException(
@@ -210,9 +386,84 @@ def delete_document(
             detail=f"Document '{document_id}' not found.",
         )
 
-    # Clean up associated vector chunks
+    # 3. Clean up associated vector chunks
     rag_app.vector_store.delete_by_document_id(document_id, user_id=user_id)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+# ------------------------------------------------------------------------------
+# 2b. File Conversion Endpoints (User Scoped)
+# ------------------------------------------------------------------------------
+@app.get("/api/documents/{document_id}/convert/targets", response_model=ConversionTargetsResponse, tags=["Conversion"])
+def get_conversion_targets(
+    document_id: str,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+) -> ConversionTargetsResponse:
+    """Get list of supported conversion target formats for a specific document."""
+    user_id = str(current_user["id"])
+    doc = repository.get_document_by_id(document_id, user_id=user_id)
+    if not doc:
+        raise HTTPException(status_code=404, detail=f"Document '{document_id}' not found.")
+    ext = Path(doc["filename"]).suffix.lower()
+    targets = get_supported_targets(ext)
+    return ConversionTargetsResponse(source_format=ext, supported_targets=targets)
+
+
+@app.post("/api/documents/{document_id}/convert", tags=["Conversion"])
+@app.get("/api/documents/{document_id}/convert", tags=["Conversion"])
+def convert_document(
+    document_id: str,
+    target_format: Optional[str] = None,
+    payload: Optional[ConversionRequest] = None,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+) -> Response:
+    """Convert an existing document to a supported target format and return converted bytes."""
+    user_id = str(current_user["id"])
+    doc = repository.get_document_by_id(document_id, user_id=user_id)
+    if not doc:
+        raise HTTPException(status_code=404, detail=f"Document '{document_id}' not found.")
+
+    tgt = target_format or (payload.target_format if payload else None)
+    if not tgt or not tgt.strip():
+        raise HTTPException(status_code=400, detail="Missing required 'target_format' parameter.")
+
+    tgt = tgt.strip().lower()
+    if not tgt.startswith("."):
+        tgt = f".{tgt}"
+
+    source_bytes = _fetch_document_bytes(doc, user_id)
+
+    try:
+        converted_bytes, out_filename, mime_type = DocumentConverter.convert(
+            source_bytes=source_bytes,
+            source_filename=doc["filename"],
+            target_format=tgt,
+        )
+    except UnsupportedConversionError as ue:
+        raise HTTPException(status_code=400, detail=str(ue))
+    except Exception as e:
+        logger.error(f"Conversion failed for document {document_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Conversion error: {e}")
+
+    # Persist in storage if Supabase/persistent storage configured
+    try:
+        storage = get_storage_service()
+        storage.upload_file(
+            file_bytes=converted_bytes,
+            filename=out_filename,
+            user_id=user_id,
+            document_id=f"converted_{document_id}",
+            content_type=mime_type,
+        )
+    except Exception as e:
+        logger.warning(f"Could not persist converted file in storage: {e}")
+
+    return Response(
+        content=converted_bytes,
+        media_type=mime_type,
+        headers={"Content-Disposition": f'attachment; filename="{out_filename}"'},
+    )
+
 
 
 # ------------------------------------------------------------------------------
@@ -582,6 +833,21 @@ def upload_document_to_chat(
 
     safe_rel_path = f"uploads/{file_hash}{file_ext}"
 
+    # Persistent storage upload (Supabase Storage in production, Local in dev)
+    storage = get_storage_service()
+    deterministic_doc_id = f"doc_{hashlib.sha256(f'{user_id}:{file_hash}'.encode()).hexdigest()[:16]}"
+    try:
+        storage_path = storage.upload_file(
+            file_bytes=content,
+            filename=safe_name,
+            user_id=user_id,
+            document_id=deterministic_doc_id,
+            content_type=file.content_type,
+        )
+    except Exception as e:
+        logger.warning(f"Could not upload file to primary storage: {e}")
+        storage_path = safe_rel_path
+
     # 7. Check if document record already exists in catalog for THIS authenticated user
     existing_doc = repository.get_document_by_hash(file_hash, user_id=user_id)
     if existing_doc is not None:
@@ -605,11 +871,12 @@ def upload_document_to_chat(
             )
             cnt = len(res.get("ids", []))
             new_doc = repository.create_document(
+                document_id=deterministic_doc_id,
                 filename=safe_name,
                 file_hash=file_hash,
                 file_size=file_size,
                 chunk_count=cnt,
-                storage_path=safe_rel_path,
+                storage_path=storage_path,
                 status="ready",
                 user_id=user_id,
             )
@@ -624,10 +891,11 @@ def upload_document_to_chat(
         else:
             # Register new pending document for authenticated user
             new_doc = repository.create_document(
+                document_id=deterministic_doc_id,
                 filename=safe_name,
                 file_hash=file_hash,
                 file_size=file_size,
-                storage_path=safe_rel_path,
+                storage_path=storage_path,
                 status="pending",
                 user_id=user_id,
             )
@@ -728,6 +996,36 @@ def remove_document_from_chat(
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
+@app.post(
+    "/api/chats/{chat_id}/documents/{document_id}",
+    response_model=DocumentRecordResponse,
+    tags=["Chat Documents"],
+)
+def attach_existing_document_to_chat(
+    chat_id: str,
+    document_id: str,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+) -> DocumentRecordResponse:
+    """Attach an existing catalog document to a chat session, verifying user ownership."""
+    user_id = str(current_user["id"])
+    chat = repository.get_chat(chat_id, user_id=user_id)
+    if not chat:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Chat '{chat_id}' not found.",
+        )
+    doc = repository.get_document_by_id(document_id, user_id=user_id)
+    if not doc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Document '{document_id}' not found.",
+        )
+    repository.attach_document_to_chat(chat_id, document_id, user_id=user_id)
+    attached_docs = repository.list_chat_documents(chat_id, user_id=user_id)
+    rec = next((d for d in attached_docs if d["id"] == document_id), doc)
+    return DocumentRecordResponse(**rec)
+
+
 # ------------------------------------------------------------------------------
 # 8. Chat-Scoped Query and Message Persistence (User Scoped)
 # ------------------------------------------------------------------------------
@@ -761,6 +1059,11 @@ def chat_in_session(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Query string must not be empty.",
         )
+
+    # Auto-title chat from first query
+    if chat.get("title") in ("New Chat", "", None):
+        auto_title = generate_chat_title(query)
+        repository.rename_chat(chat_id, auto_title, user_id=user_id)
 
     # Retrieve ready documents attached to this chat
     attached_docs = repository.list_chat_documents(chat_id, user_id=user_id)
@@ -906,6 +1209,11 @@ def chat_in_session_stream(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Query string must not be empty.",
         )
+
+    # Auto-title chat from first query
+    if chat.get("title") in ("New Chat", "", None):
+        auto_title = generate_chat_title(query)
+        repository.rename_chat(chat_id, auto_title, user_id=user_id)
 
     attached_docs = repository.list_chat_documents(chat_id, user_id=user_id)
     ready_docs = [d for d in attached_docs if d["status"] == "ready"]

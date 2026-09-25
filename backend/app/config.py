@@ -5,7 +5,7 @@ Loads settings from environment variables or .env file with sensible production 
 
 import os
 from pathlib import Path
-from typing import Any, List
+from typing import Any, List, Optional
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic import Field, field_validator
 
@@ -44,8 +44,17 @@ class Settings(BaseSettings):
     documents_dir: str = Field(default=str(_BACKEND_DIR / "documents"), alias="DOCUMENTS_DIR")
 
     # Database settings
+    database_url: Optional[str] = Field(default=None, alias="DATABASE_URL")
     database_path: str = Field(default=str(_BACKEND_DIR / "data" / "rag_app.db"), alias="DATABASE_PATH")
     upload_dir: str = Field(default=str(_BACKEND_DIR / "data" / "uploads"), alias="UPLOAD_DIR")
+
+    # Supabase Storage settings
+    supabase_url: str = Field(default="https://ldytwnvxskfajjwcxxtb.supabase.co", alias="SUPABASE_URL")
+    supabase_service_role_key: Optional[str] = Field(default=None, alias="SUPABASE_SERVICE_ROLE_KEY")
+    supabase_storage_bucket: str = Field(default="rag-files", alias="SUPABASE_STORAGE_BUCKET")
+
+    # Vector store provider: "chroma" (default) or "pgvector"
+    vector_store_provider: str = Field(default="chroma", alias="VECTOR_STORE_PROVIDER")
 
     # Chunking settings
     chunk_size: int = Field(default=800, alias="CHUNK_SIZE")
@@ -107,6 +116,22 @@ class Settings(BaseSettings):
     @property
     def database_abs_path(self) -> Path:
         return Path(self.database_path).resolve()
+
+    @property
+    def is_postgres(self) -> bool:
+        return bool(self.database_url and self.database_url.strip())
+
+    @property
+    def is_supabase_storage(self) -> bool:
+        return bool(
+            self.supabase_url
+            and self.supabase_service_role_key
+            and self.supabase_service_role_key.strip()
+        )
+
+    @property
+    def is_pgvector(self) -> bool:
+        return bool(self.vector_store_provider.lower() == "pgvector" and self.is_postgres)
 
     @property
     def upload_abs_path(self) -> Path:

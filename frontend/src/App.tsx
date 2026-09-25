@@ -9,7 +9,15 @@ import {
 } from './api/client';
 import { useAuth } from './context/AuthContext';
 import { AuthPage } from './components/AuthPage';
+import MarkdownRenderer from './components/MarkdownRenderer';
 import './App.css';
+
+function formatFileSize(bytes?: number | null): string {
+  if (!bytes || bytes <= 0) return '0 B';
+  const units = ['B', 'KB', 'MB', 'GB'];
+  const i = Math.floor(Math.log(bytes) / Math.log(1024));
+  return `${(bytes / Math.pow(1024, i)).toFixed(1)} ${units[i]}`;
+}
 
 type Message = {
   id?: string;
@@ -82,6 +90,111 @@ function App() {
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  // File Library & Search State
+  const [catalogSearch, setCatalogSearch] = useState('');
+  const [chatSearch, setChatSearch] = useState('');
+  const [convertingDocId, setConvertingDocId] = useState<string | null>(null);
+  const [conversionTargets, setConversionTargets] = useState<{ [docId: string]: string[] }>({});
+  const [selectedFormat, setSelectedFormat] = useState<{ [docId: string]: string }>({});
+  const [libraryAlert, setLibraryAlert] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
+
+  // File Library Action Handlers (Phases 7 & 8)
+  const handleViewDocument = async (docId?: string) => {
+    if (!docId) return;
+    try {
+      const url = await api.viewDocumentBlobUrl(docId);
+      window.open(url, '_blank');
+    } catch (err) {
+      setLibraryAlert({
+        type: 'error',
+        text: err instanceof Error ? err.message : 'Could not view document inline.',
+      });
+    }
+  };
+
+  const handleDownloadDocument = async (docId?: string, filename?: string) => {
+    if (!docId || !filename) return;
+    try {
+      await api.downloadDocument(docId, filename);
+    } catch (err) {
+      setLibraryAlert({
+        type: 'error',
+        text: err instanceof Error ? err.message : 'Download failed.',
+      });
+    }
+  };
+
+  const handleDeleteDocument = async (docId?: string, filename?: string) => {
+    if (!docId) return;
+    if (!window.confirm(`Are you sure you want to delete "${filename || 'this document'}" from your library?`)) {
+      return;
+    }
+    try {
+      await api.deleteDocument(docId);
+      const docsRes = await api.documents();
+      setDocuments(docsRes);
+      if (activeChatId) {
+        const activeDocs = await api.listChatDocuments(activeChatId);
+        setChatDocs(activeDocs);
+      }
+      setLibraryAlert({ type: 'success', text: `Document "${filename || docId}" deleted successfully.` });
+    } catch (err) {
+      setLibraryAlert({
+        type: 'error',
+        text: err instanceof Error ? err.message : 'Failed to delete document.',
+      });
+    }
+  };
+
+  const handleAttachDocumentToActiveChat = async (docId?: string, filename?: string) => {
+    if (!docId || !activeChatId) return;
+    try {
+      await api.attachDocumentToChat(activeChatId, docId);
+      const activeDocs = await api.listChatDocuments(activeChatId);
+      setChatDocs(activeDocs);
+      setLibraryAlert({ type: 'success', text: `Attached "${filename || docId}" to the active chat.` });
+    } catch (err) {
+      setLibraryAlert({
+        type: 'error',
+        text: err instanceof Error ? err.message : 'Failed to attach document.',
+      });
+    }
+  };
+
+  const handleFetchConversionTargets = async (docId?: string) => {
+    if (!docId) return;
+    try {
+      const res = await api.getConversionTargets(docId);
+      setConversionTargets((prev) => ({ ...prev, [docId]: res.supported_targets }));
+      if (res.supported_targets.length > 0 && !selectedFormat[docId]) {
+        setSelectedFormat((prev) => ({ ...prev, [docId]: res.supported_targets[0].replace('.', '') }));
+      }
+    } catch (err) {
+      console.warn('Could not load conversion targets:', err);
+    }
+  };
+
+  const handleConvertDocument = async (docId?: string, filename?: string) => {
+    if (!docId || !filename) return;
+    const target = selectedFormat[docId] || (conversionTargets[docId] && conversionTargets[docId][0]?.replace('.', ''));
+    if (!target) return;
+    setConvertingDocId(docId);
+    setLibraryAlert(null);
+    try {
+      const baseName = filename.substring(0, filename.lastIndexOf('.')) || filename;
+      const fallbackName = `${baseName}.${target}`;
+      await api.convertDocument(docId, target, fallbackName);
+      setLibraryAlert({ type: 'success', text: `Converted and downloaded "${fallbackName}" successfully!` });
+    } catch (err) {
+      setLibraryAlert({
+        type: 'error',
+        text: err instanceof Error ? err.message : 'File conversion failed.',
+      });
+    } finally {
+      setConvertingDocId(null);
+    }
+  };
 
   // Helper: Load messages and documents for a specific chat
   const loadChatDetails = async (chatId: string) => {
@@ -361,12 +474,8 @@ function App() {
         true
       );
 
-      // Re-sort chats so active chat moves to top
-      const nowIso = new Date().toISOString();
-      setChats((prev) => {
-        const updated = prev.map((c) => (c.id === activeChatId ? { ...c, updated_at: nowIso } : c));
-        return [...updated].sort((a, b) => new Date(b.updated_at).getTime() - new Date(a.updated_at).getTime());
-      });
+      // Re-fetch chats so auto-generated titles and recent sort are immediately reflected
+      api.listChats().then(setChats).catch(() => {});
     } catch (err) {
       console.warn('Streaming failed, attempting non-streaming fallback:', err);
       try {
@@ -482,8 +591,31 @@ function App() {
               <span className="chats-count-badge">{chats.length}</span>
             </div>
 
+            {chats.length > 3 && (
+              <div style={{ padding: '0 4px 8px 4px' }}>
+                <input
+                  type="text"
+                  placeholder="Filter chats..."
+                  value={chatSearch}
+                  onChange={(e) => setChatSearch(e.target.value)}
+                  style={{
+                    width: '100%',
+                    padding: '5px 9px',
+                    fontSize: '0.78rem',
+                    background: 'rgba(255, 255, 255, 0.12)',
+                    border: '1px solid rgba(255, 255, 255, 0.2)',
+                    borderRadius: 'var(--radius-sm)',
+                    color: '#FFFFFF',
+                    outline: 'none',
+                  }}
+                />
+              </div>
+            )}
+
             <div className="recent-chats-list" role="list">
-              {chats.map((chat) => (
+              {chats
+                .filter((c) => !chatSearch || c.title.toLowerCase().includes(chatSearch.toLowerCase()))
+                .map((chat) => (
                 <div
                   key={chat.id}
                   className={`chat-row-item ${chat.id === activeChatId ? 'active' : ''}`}
@@ -875,7 +1007,11 @@ function App() {
 
                     <div className="message-body-wrap">
                       <div className={`message-bubble ${msg.role}`}>
-                        <div className="bubble-text">{msg.content}</div>
+                        {msg.role === 'assistant' ? (
+                          <MarkdownRenderer content={msg.content} className="bubble-text assistant-markdown" />
+                        ) : (
+                          <div className="bubble-text">{msg.content}</div>
+                        )}
                         {msg.timestamp && (
                           <div className="message-timestamp">{msg.timestamp}</div>
                         )}
@@ -978,44 +1114,175 @@ function App() {
           </main>
         )}
 
-        {/* TAB 2: GLOBAL DOCUMENTS VIEW */}
+        {/* TAB 2: GLOBAL DOCUMENTS VIEW (Phases 7 & 8 File Library) */}
         {activeTab === 'documents' && (
           <main className="tab-view-container">
             <div className="tab-view-header">
-              <h2 className="tab-view-title">Global Document Catalog</h2>
+              <h2 className="tab-view-title">Document Library & File Catalog</h2>
               <p className="tab-view-subtitle">
-                The multi-document RAG assistant indexes {docCount} documents totaling {chunkCount} chunk embeddings in ChromaDB.
+                Manage your persistent documents, view/download originals, convert file formats, and attach files to active chats.
               </p>
             </div>
 
+            {libraryAlert && (
+              <div className={`library-alert-banner ${libraryAlert.type}`} role="alert">
+                <span>{libraryAlert.type === 'success' ? '✓' : '⚠️'} {libraryAlert.text}</span>
+                <button type="button" onClick={() => setLibraryAlert(null)} style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'inherit', fontWeight: 'bold' }}>✕</button>
+              </div>
+            )}
+
+            <div className="library-toolbar">
+              <input
+                type="text"
+                placeholder="Filter documents by filename or extension..."
+                value={catalogSearch}
+                onChange={(e) => setCatalogSearch(e.target.value)}
+                className="library-search-input"
+              />
+              <span className="doc-meta-counts">
+                Showing {
+                  (documents?.documents || []).filter((d) =>
+                    !catalogSearch || d.filename.toLowerCase().includes(catalogSearch.toLowerCase())
+                  ).length
+                } of {docCount} documents
+              </span>
+            </div>
+
             <div className="documents-catalog-grid">
-              {documents?.documents.map((doc, idx) => (
-                <div key={idx} className="doc-catalog-card">
-                  <div className="doc-card-head">
-                    {(() => { const ft = getFileTypeLabel(doc.filename); return (
-                      <div className="doc-file-icon-label" style={{ background: ft.color }}>
-                        {ft.label}
+              {(documents?.documents || [])
+                .filter((doc) => !catalogSearch || doc.filename.toLowerCase().includes(catalogSearch.toLowerCase()))
+                .map((doc, idx) => {
+                  const ft = getFileTypeLabel(doc.filename);
+                  const isAttached = chatDocs.some((cd) => cd.id === doc.id || cd.filename === doc.filename);
+                  const targets = conversionTargets[doc.id || ''] || [];
+                  const isConverting = convertingDocId === doc.id;
+
+                  return (
+                    <div key={doc.id || idx} className="doc-catalog-card">
+                      <div>
+                        <div className="doc-card-head">
+                          <div className="doc-file-icon-label" style={{ background: ft.color }}>
+                            {doc.file_type || ft.label}
+                          </div>
+                          <div style={{ flex: 1, minWidth: 0 }}>
+                            <h3 className="doc-name" title={doc.filename}>{doc.filename}</h3>
+                            <div className="doc-card-meta-row">
+                              {doc.file_size != null && (
+                                <span className="doc-meta-badge">{formatFileSize(doc.file_size)}</span>
+                              )}
+                              {doc.page_count != null && (
+                                <span className="doc-meta-badge">{doc.page_count} pages</span>
+                              )}
+                              <span className="doc-meta-badge">{doc.chunk_count} chunks</span>
+                              {doc.created_at && (
+                                <span className="doc-meta-badge">{new Date(doc.created_at).toLocaleDateString()}</span>
+                              )}
+                            </div>
+                          </div>
+                        </div>
+
+                        {doc.sections && doc.sections.length > 0 && (
+                          <div className="doc-sections-list">
+                            <span className="sections-title">Indexed Sections:</span>
+                            <div className="sections-chips">
+                              {doc.sections.map((sec, sidx) => (
+                                <span key={sidx} className="section-chip">{sec}</span>
+                              ))}
+                            </div>
+                          </div>
+                        )}
                       </div>
-                    ); })()}
-                    <div>
-                      <h3 className="doc-name">{doc.filename}</h3>
-                      <span className="doc-meta-counts">
-                        {doc.page_count != null ? `${doc.page_count} Pages/Slides/Sheets · ` : ''}{doc.chunk_count} Chunks
-                      </span>
-                    </div>
-                  </div>
-                  {doc.sections && doc.sections.length > 0 && (
-                    <div className="doc-sections-list">
-                      <span className="sections-title">Indexed Sections:</span>
-                      <div className="sections-chips">
-                        {doc.sections.map((sec, sidx) => (
-                          <span key={sidx} className="section-chip">{sec}</span>
-                        ))}
+
+                      <div className="doc-card-actions">
+                        {/* View Button */}
+                        <button
+                          type="button"
+                          className="doc-btn"
+                          onClick={() => handleViewDocument(doc.id)}
+                          title="View document inline"
+                        >
+                          👁️ View
+                        </button>
+
+                        {/* Download Button */}
+                        <button
+                          type="button"
+                          className="doc-btn"
+                          onClick={() => handleDownloadDocument(doc.id, doc.filename)}
+                          title="Download original file"
+                        >
+                          ⬇️ Download
+                        </button>
+
+                        {/* Attach to Active Chat Button */}
+                        {activeChatId && !isAttached && (
+                          <button
+                            type="button"
+                            className="doc-btn primary"
+                            onClick={() => handleAttachDocumentToActiveChat(doc.id, doc.filename)}
+                            title="Attach this file to active chat"
+                          >
+                            + Attach to Chat
+                          </button>
+                        )}
+                        {isAttached && (
+                          <span className="doc-meta-badge" style={{ color: '#2ab8a8', fontWeight: 600 }}>
+                            ✓ In Active Chat
+                          </span>
+                        )}
+
+                        {/* Convert Button / Dropdown */}
+                        {doc.id && (
+                          <div className="convert-select-box">
+                            <button
+                              type="button"
+                              className="doc-btn"
+                              onClick={() => {
+                                if (!conversionTargets[doc.id!]) {
+                                  handleFetchConversionTargets(doc.id);
+                                } else {
+                                  handleConvertDocument(doc.id, doc.filename);
+                                }
+                              }}
+                              disabled={isConverting}
+                              title="Convert file format"
+                            >
+                              {isConverting ? 'Converting...' : '🔄 Convert'}
+                            </button>
+                            {targets.length > 0 && (
+                              <select
+                                className="convert-select"
+                                value={selectedFormat[doc.id] || targets[0]?.replace('.', '')}
+                                onChange={(e) => setSelectedFormat((prev) => ({ ...prev, [doc.id!]: e.target.value }))}
+                              >
+                                {targets.map((tgt, ti) => {
+                                  const fmt = tgt.replace('.', '');
+                                  return (
+                                    <option key={ti} value={fmt}>
+                                      → {fmt.toUpperCase()}
+                                    </option>
+                                  );
+                                })}
+                              </select>
+                            )}
+                          </div>
+                        )}
+
+                        {/* Delete Button */}
+                        {doc.id && (
+                          <button
+                            type="button"
+                            className="doc-btn danger"
+                            onClick={() => handleDeleteDocument(doc.id, doc.filename)}
+                            title="Delete file permanently"
+                          >
+                            🗑️ Delete
+                          </button>
+                        )}
                       </div>
                     </div>
-                  )}
-                </div>
-              ))}
+                  );
+                })}
             </div>
 
             <div className="tab-cta-wrap">
