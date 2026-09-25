@@ -185,6 +185,50 @@ def close_db() -> None:
             _pg_pool = None
 
 
+class PooledConnectionProxy:
+    """
+    Context manager and connection proxy that borrows a connection from the pool
+    and safely returns it upon exit or close, preventing pool connection exhaustion.
+    """
+
+    def __init__(self, pool: Any):
+        self._pool = pool
+        self._conn = None
+        self._cm = None
+
+    def __enter__(self) -> Any:
+        self._cm = self._pool.connection()
+        self._conn = self._cm.__enter__()
+        return self._conn
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> Any:
+        if self._cm is not None:
+            res = self._cm.__exit__(exc_type, exc_val, exc_tb)
+            self._cm = None
+            self._conn = None
+            return res
+
+    def close(self) -> None:
+        if self._cm is not None:
+            try:
+                self._cm.__exit__(None, None, None)
+            except Exception:
+                pass
+            self._cm = None
+            self._conn = None
+        elif self._conn is not None:
+            try:
+                self._pool.putconn(self._conn)
+            except Exception:
+                pass
+            self._conn = None
+
+    def __getattr__(self, name: str) -> Any:
+        if self._conn is None:
+            self._conn = self._pool.getconn()
+        return getattr(self._conn, name)
+
+
 def get_db_connection(custom_path: Optional[str | Path] = None) -> Any:
     """
     Open/borrow a database connection.
@@ -208,7 +252,7 @@ def get_db_connection(custom_path: Optional[str | Path] = None) -> Any:
         return conn
     else:
         pool = get_pg_pool()
-        return pool.getconn()
+        return PooledConnectionProxy(pool)
 
 
 def _init_sqlite_db(custom_path: Optional[str | Path] = None) -> None:

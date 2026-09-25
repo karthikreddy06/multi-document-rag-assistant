@@ -130,3 +130,48 @@ CREATE INDEX IF NOT EXISTS idx_messages_chat_id
 -- Ordering index for chronological message stream
 CREATE INDEX IF NOT EXISTS idx_messages_created_at
     ON messages(created_at ASC);
+
+-- -----------------------------------------------------------------------------
+-- 7. Document Chunks & pgvector Storage
+-- -----------------------------------------------------------------------------
+CREATE EXTENSION IF NOT EXISTS vector;
+
+CREATE TABLE IF NOT EXISTS document_chunks (
+    id TEXT PRIMARY KEY,
+    document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    chunk_index INTEGER NOT NULL,
+    chunk_text TEXT NOT NULL,
+    embedding vector(384) NOT NULL,
+    filename TEXT NOT NULL DEFAULT '',
+    page_number INTEGER,
+    section TEXT,
+    metadata JSONB,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_doc_chunks_doc_id ON document_chunks(document_id);
+CREATE INDEX IF NOT EXISTS idx_doc_chunks_user_id ON document_chunks(user_id);
+CREATE INDEX IF NOT EXISTS idx_doc_chunks_embedding ON document_chunks USING hnsw (embedding vector_cosine_ops);
+
+-- -----------------------------------------------------------------------------
+-- 8. Storage Bucket & RLS Policy
+-- -----------------------------------------------------------------------------
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM information_schema.schemata WHERE schema_name = 'storage') THEN
+        IF NOT EXISTS (
+            SELECT 1 FROM pg_policies
+            WHERE schemaname = 'storage' AND tablename = 'objects' AND policyname = 'rag_files_bucket_policy'
+        ) THEN
+            CREATE POLICY rag_files_bucket_policy
+            ON storage.objects
+            FOR ALL
+            TO public, anon, authenticated, service_role
+            USING (bucket_id = 'rag-files')
+            WITH CHECK (bucket_id = 'rag-files');
+        END IF;
+    END IF;
+END
+$$;
+

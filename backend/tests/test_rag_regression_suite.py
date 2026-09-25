@@ -29,6 +29,9 @@ from app.ingestion.pipeline import IngestionPipeline
 @pytest.fixture(scope="module")
 def rag_app():
     """Initialize RAG Application ensuring full collection is indexed."""
+    from app.config import settings as _settings
+    if _settings.is_pgvector:
+        pytest.skip("Skipping local auto-ingest regression suite in pgvector/production mode.")
     app = RAGApplication()
     if app.vector_store.count() == 0:
         app.ingest()

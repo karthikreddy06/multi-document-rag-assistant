@@ -13,6 +13,9 @@ from app.vectorstore.store import VectorStore
 
 @pytest.fixture(scope="module")
 def retriever():
+    from app.config import settings as _settings
+    if _settings.is_pgvector:
+        pytest.skip("Skipping Chroma-based adaptive retrieval tests in pgvector/production mode.")
     vs = VectorStore()
     if vs.count() == 0:
         pytest.skip("ChromaDB is empty. Ingestion required.")

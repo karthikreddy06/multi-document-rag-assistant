@@ -72,6 +72,11 @@ class BaseStorageService(ABC):
         """Check whether the file exists in storage."""
         pass
 
+    @abstractmethod
+    def list_objects(self, prefix: str = "") -> List[str]:
+        """List object paths matching prefix."""
+        pass
+
 
 class LocalStorageService(BaseStorageService):
     """Local filesystem storage backend for development and test environments."""
@@ -122,6 +127,18 @@ class LocalStorageService(BaseStorageService):
         except Exception:
             return False
 
+    def list_objects(self, prefix: str = "") -> List[str]:
+        target_dir = self.base_dir / prefix if prefix else self.base_dir
+        if not target_dir.exists():
+            return []
+        paths = []
+        for p in self.base_dir.rglob("*"):
+            if p.is_file():
+                rel = str(p.relative_to(self.base_dir)).replace("\\", "/")
+                if not prefix or rel.startswith(prefix):
+                    paths.append(rel)
+        return sorted(paths)
+
 
 class SupabaseStorageService(BaseStorageService):
     """
@@ -136,7 +153,11 @@ class SupabaseStorageService(BaseStorageService):
         bucket: Optional[str] = None,
     ):
         self.supabase_url = (supabase_url or settings.supabase_url).rstrip("/")
-        self.service_role_key = (service_role_key or settings.supabase_service_role_key or "").strip()
+        self.service_role_key = (
+            service_role_key
+            or settings.effective_supabase_secret_key
+            or ""
+        ).strip()
         self.bucket = bucket or settings.supabase_storage_bucket or "rag-files"
         self._bucket_verified = False
 
@@ -161,6 +182,15 @@ class SupabaseStorageService(BaseStorageService):
             with httpx.Client(timeout=10.0) as client:
                 resp = client.get(url, headers=self._get_headers())
                 if resp.status_code == 200:
+                    bucket_data = resp.json()
+                    # Enforce private bucket
+                    if bucket_data.get("public") is True:
+                        client.put(
+                            url,
+                            headers=self._get_headers("application/json"),
+                            json={"id": self.bucket, "name": self.bucket, "public": False},
+                        )
+                        logger.info(f"SupabaseStorage: Updated bucket '{self.bucket}' to private.")
                     self._bucket_verified = True
                     return
 
@@ -259,6 +289,49 @@ class SupabaseStorageService(BaseStorageService):
                 return resp.status_code in (200, 206)
         except Exception:
             return False
+
+    def list_objects(self, prefix: str = "") -> List[str]:
+        """List all object paths in the bucket (recursively), optionally under a prefix."""
+        self._ensure_bucket()
+        clean_prefix = prefix.strip("/")
+        results: List[str] = []
+
+        def _traverse(current_prefix: str) -> None:
+            offset = 0
+            limit = 100
+            while True:
+                url = f"{self.supabase_url}/storage/v1/object/list/{self.bucket}"
+                payload = {
+                    "prefix": current_prefix,
+                    "limit": limit,
+                    "offset": offset,
+                    "sortBy": {"column": "name", "order": "asc"},
+                }
+                with httpx.Client(timeout=15.0) as client:
+                    resp = client.post(url, headers=self._get_headers("application/json"), json=payload)
+                    if resp.status_code != 200:
+                        logger.warning(f"SupabaseStorage: Failed to list objects in '{current_prefix}': {resp.status_code}")
+                        break
+                    items = resp.json()
+                    if not items:
+                        break
+
+                    for item in items:
+                        name = item.get("name")
+                        if not name:
+                            continue
+                        sub_path = f"{current_prefix}/{name}" if current_prefix else name
+                        if item.get("id") is None:
+                            _traverse(sub_path)
+                        else:
+                            results.append(sub_path)
+
+                    if len(items) < limit:
+                        break
+                    offset += limit
+
+        _traverse(clean_prefix)
+        return sorted(results)
 
 
 # Singleton instance

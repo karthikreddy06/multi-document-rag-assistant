@@ -50,6 +50,7 @@ class Settings(BaseSettings):
 
     # Supabase Storage settings
     supabase_url: str = Field(default="https://ldytwnvxskfajjwcxxtb.supabase.co", alias="SUPABASE_URL")
+    supabase_secret_key: Optional[str] = Field(default=None, alias="SUPABASE_SECRET_KEY")
     supabase_service_role_key: Optional[str] = Field(default=None, alias="SUPABASE_SERVICE_ROLE_KEY")
     supabase_storage_bucket: str = Field(default="rag-files", alias="SUPABASE_STORAGE_BUCKET")
 
@@ -122,12 +123,13 @@ class Settings(BaseSettings):
         return bool(self.database_url and self.database_url.strip())
 
     @property
+    def effective_supabase_secret_key(self) -> Optional[str]:
+        return self.supabase_secret_key or self.supabase_service_role_key
+
+    @property
     def is_supabase_storage(self) -> bool:
-        return bool(
-            self.supabase_url
-            and self.supabase_service_role_key
-            and self.supabase_service_role_key.strip()
-        )
+        key = self.effective_supabase_secret_key
+        return bool(self.supabase_url and key and key.strip())
 
     @property
     def is_pgvector(self) -> bool:

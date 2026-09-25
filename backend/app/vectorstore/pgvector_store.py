@@ -7,7 +7,7 @@ matching the ChromaDB VectorStore interface for drop-in compatibility.
 import json
 from typing import Any, Dict, List, Optional, Tuple
 from app.config import settings
-from app.db.database import get_db_connection
+from app.db.database import get_db_connection, get_pg_pool, PooledConnectionProxy
 from app.models import Chunk
 from app.utils.logger import setup_logger
 
@@ -88,12 +88,19 @@ class PgVectorStore(VectorStore):
     def __init__(self, table_name: str = "document_chunks"):
         self.table_name = table_name
         self.collection = self  # Expose collection shim for collection.get() compatibility
+        # Capture the pool at construction time so monkeypatching settings later
+        # cannot accidentally cause get_db_connection() to return a SQLite conn.
+        self._pool = get_pg_pool()
         logger.info(f"PgVectorStore initialized with table '{self.table_name}'.")
+
+    def _get_conn(self):
+        """Return a pooled PostgreSQL connection context manager."""
+        return PooledConnectionProxy(self._pool)
 
     def count(self) -> int:
         """Return total chunks in document_chunks."""
         try:
-            with get_db_connection() as conn:
+            with self._get_conn() as conn:
                 with conn.cursor() as cur:
                     cur.execute(f"SELECT COUNT(*) as cnt FROM {self.table_name}")
                     row = cur.fetchone()
@@ -106,7 +113,7 @@ class PgVectorStore(VectorStore):
         """Clear all chunks from the table."""
         logger.info(f"Clearing all rows from '{self.table_name}'...")
         try:
-            with get_db_connection() as conn:
+            with self._get_conn() as conn:
                 with conn.cursor() as cur:
                     cur.execute(f"TRUNCATE TABLE {self.table_name}")
                 conn.commit()
@@ -148,11 +155,11 @@ class PgVectorStore(VectorStore):
         """
 
         try:
-            with get_db_connection() as conn:
+            with self._get_conn() as conn:
                 with conn.cursor() as cur:
                     for chunk, emb in zip(chunks, embeddings):
                         meta = dict(chunk.metadata or {})
-                        doc_id = meta.get("document_id") or chunk.document_id
+                        doc_id = meta.get("document_id") or None
                         user_id = meta.get("user_id") or "legacy_user"
                         chunk_idx = meta.get("chunk_index", 0)
                         filename = meta.get("filename", "")
@@ -161,21 +168,10 @@ class PgVectorStore(VectorStore):
                         emb_str = str(emb)
                         meta_json = json.dumps(meta)
 
-                        cur.execute(
-                            insert_sql,
-                            (
-                                chunk.chunk_id,
-                                doc_id,
-                                user_id,
-                                chunk_idx,
-                                chunk.text,
-                                emb_str,
-                                filename,
-                                page_num,
-                                section,
-                                meta_json,
-                            ),
-                        )
+                        cur.execute(insert_sql, (
+                                chunk.chunk_id, doc_id, user_id, chunk_idx, chunk.text,
+                                emb_str, filename, page_num, section, meta_json,
+                            ))
                 conn.commit()
             logger.info(f"Successfully upserted {len(chunks)} chunks into PgVectorStore.")
             return len(chunks)
@@ -219,7 +215,7 @@ class PgVectorStore(VectorStore):
         query_params = [emb_str, *params, emb_str, k]
 
         try:
-            with get_db_connection() as conn:
+            with self._get_conn() as conn:
                 with conn.cursor() as cur:
                     cur.execute(sql, query_params)
                     rows = cur.fetchall()
@@ -287,7 +283,7 @@ class PgVectorStore(VectorStore):
         """
 
         try:
-            with get_db_connection() as conn:
+            with self._get_conn() as conn:
                 with conn.cursor() as cur:
                     cur.execute(sql, params)
                     rows = cur.fetchall()
@@ -325,7 +321,7 @@ class PgVectorStore(VectorStore):
         if not filename:
             return 0
         try:
-            with get_db_connection() as conn:
+            with self._get_conn() as conn:
                 with conn.cursor() as cur:
                     if user_id:
                         cur.execute(
@@ -351,7 +347,7 @@ class PgVectorStore(VectorStore):
         if not document_id:
             return 0
         try:
-            with get_db_connection() as conn:
+            with self._get_conn() as conn:
                 with conn.cursor() as cur:
                     if user_id:
                         cur.execute(
@@ -375,7 +371,7 @@ class PgVectorStore(VectorStore):
     def get_indexed_files(self, user_id: Optional[str] = None) -> Dict[str, str]:
         """Return {filename: file_hash} mapping for indexed documents."""
         try:
-            with get_db_connection() as conn:
+            with self._get_conn() as conn:
                 with conn.cursor() as cur:
                     if user_id:
                         cur.execute(
