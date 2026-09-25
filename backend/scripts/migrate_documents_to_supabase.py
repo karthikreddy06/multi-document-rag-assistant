@@ -33,6 +33,49 @@ from app.utils.logger import setup_logger
 
 logger = setup_logger("scripts.migrate_documents_to_supabase")
 
+# ─── Explicit test/fixture exclusion list ─────────────────────────────────────
+# These files MUST NEVER be uploaded to Supabase Storage or indexed into pgvector.
+# Verified against: backend/documents/ (Chroma test corpus) and test source code.
+#
+# To ADD a production document: do NOT add it here. Upload it through the RAG app.
+# To EXCLUDE a new test fixture: add its filename here.
+TEST_FIXTURE_EXCLUSION_LIST = frozenset({
+    # ── backend/documents/ Chroma test corpus ──────────────────────────────
+    "Alice_in_Wonderland.pdf",   # referenced in test_retrieval_generic.py, test_adaptive_retrieval.py
+    "oldmansea.pdf",             # referenced in test_retrieval_generic.py, test_adaptive_retrieval.py
+    "sample.pdf",                # referenced in test_retrieval_generic.py (pdflatex compilation)
+    "company.pdf",               # referenced in test_adaptive_retrieval.py (company queries)
+    # ── Benchmark / dataset files ──────────────────────────────────────────
+    "Dataset.XLSX",
+    "Dataset.xlsx",
+    # ── Synthetic test files ───────────────────────────────────────────────
+    "test.pdf",
+    "test.txt",
+    "notes.txt",
+    "scores.csv",
+    "staff.csv",
+    "cascade_test.pdf",
+})
+
+# Filename patterns that indicate a test/benchmark file (case-insensitive)
+TEST_FIXTURE_KEYWORDS = ("_test.", "test_", "dataset", "benchmark", "fixture", "dummy", "mock")
+
+
+def is_test_fixture(filename: str) -> tuple:
+    """
+    Return (True, reason) if the file is a known test fixture or benchmark.
+    Return (False, '') for production documents.
+
+    This is the definitive exclusion gate — any file matching here will never
+    be uploaded to Supabase Storage or indexed into pgvector by migration scripts.
+    """
+    if filename in TEST_FIXTURE_EXCLUSION_LIST:
+        return True, f"explicit fixture exclusion list"
+    fn_lower = filename.lower()
+    for kw in TEST_FIXTURE_KEYWORDS:
+        if kw in fn_lower:
+            return True, f"keyword pattern '{kw}' in filename"
+    return False, ""
 
 def find_candidate_local_files() -> List[Path]:
     """Scan candidate local storage directories for uploaded source files."""
@@ -182,6 +225,16 @@ def run_migration() -> Dict[str, int]:
         filename = doc["filename"]
         file_hash = doc["file_hash"]
         current_storage_path = (doc.get("storage_path") or "").strip()
+
+        # --- Exclusion gate: test/fixture/benchmark files are NEVER migrated ---
+        is_fixture, fixture_reason = is_test_fixture(filename)
+        if is_fixture:
+            logger.info(
+                f"[EXCLUDED] Skipping test/fixture file: '{filename}' "
+                f"(reason: {fixture_reason}). Not uploading to Supabase."
+            )
+            skipped_count += 1
+            continue
 
         # --- Skip check: already fully migrated ---
         already_in_storage = current_storage_path.startswith("users/")

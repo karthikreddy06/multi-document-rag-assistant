@@ -35,6 +35,16 @@ USER_ID   = "legacy_user"
 EMBED_BATCH = 200   # chunks per ONNX call – tune lower if OOM
 DB_BATCH    = 200   # chunks per INSERT transaction
 
+# ─── PRODUCTION GUARD ──────────────────────────────────────────────────────────
+# Dataset.XLSX is a confirmed test/benchmark dataset — it must NOT be indexed
+# into production pgvector. This script is retained for reference only.
+# If you intentionally need to re-run it, remove this guard with explicit approval.
+raise SystemExit(
+    f"BLOCKED: '{FILENAME}' is a test/benchmark dataset and must NOT be indexed "
+    f"into production pgvector. Remove this guard only with explicit approval. "
+    f"To index a real production document, use migrate_documents_to_supabase.py."
+)
+
 
 def find_xlsx_file() -> Path:
     candidate_dirs = [
