@@ -94,7 +94,7 @@ class Settings(BaseSettings):
 
     # Authentication & Security settings
     jwt_secret_key: str = Field(
-        default="rag_assistant_dev_secret_key_change_in_production_32b+",
+        default="",
         alias="JWT_SECRET_KEY"
     )
     jwt_algorithm: str = Field(default="HS256", alias="JWT_ALGORITHM")

@@ -49,6 +49,9 @@ def create_access_token(
     """
     Generate a signed JWT access token containing claims and an expiration time.
     """
+    if not settings.jwt_secret_key:
+        raise RuntimeError("JWT_SECRET_KEY is not configured in the environment.")
+
     to_encode = data.copy()
     now = datetime.now(timezone.utc)
     expire = now + (
@@ -70,6 +73,9 @@ def decode_access_token(token: str) -> Optional[Dict[str, Any]]:
     Decode and validate a JWT access token.
     Returns the decoded claims dictionary if valid, or None if expired or invalid.
     """
+    if not settings.jwt_secret_key:
+        raise RuntimeError("JWT_SECRET_KEY is not configured in the environment.")
+
     try:
         payload = jwt.decode(
             token,
