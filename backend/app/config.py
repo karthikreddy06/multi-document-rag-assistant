@@ -24,6 +24,7 @@ class Settings(BaseSettings):
     llm_api_key: str = Field(default="", alias="LLM_API_KEY")
     llm_num_predict: int = Field(default=120, alias="LLM_NUM_PREDICT")
     llm_num_ctx: int = Field(default=1536, alias="LLM_NUM_CTX")
+    vision_model: str = Field(default="qwen/qwen3.8-27b", alias="VISION_MODEL")
 
     embedding_provider: str = Field(default="ollama", alias="EMBEDDING_PROVIDER")
     embedding_model: str = Field(default="nomic-embed-text", alias="EMBEDDING_MODEL")
@@ -181,6 +182,10 @@ class Settings(BaseSettings):
         if p == "cloud" and self.llm_model == "llama3.2:1b":
             return "gemini-3.6-flash"
         return self.llm_model
+
+    @property
+    def effective_vision_model(self) -> str:
+        return self.vision_model or "qwen/qwen3.8-27b"
 
     @property
     def effective_embedding_model(self) -> str:

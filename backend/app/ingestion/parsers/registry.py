@@ -48,6 +48,16 @@ class ParserRegistry:
 
     def _register_defaults(self, vision_hook=None) -> None:
         """Register all built-in parsers for their supported extensions."""
+        effective_vision_hook = vision_hook
+        if effective_vision_hook is None:
+            try:
+                from app.services.vision import get_vision_service
+                vs = get_vision_service()
+                if vs and vs.is_configured:
+                    effective_vision_hook = vs.describe_image
+            except Exception as e:
+                logger.warning(f"Could not initialize default vision hook: {e}")
+
         default_parsers: List[BaseParser] = [
             PDFParser(),
             DOCXParser(),
@@ -55,7 +65,7 @@ class ParserRegistry:
             XLSXParser(),
             CSVParser(),
             TextParser(),
-            ImageParser(vision_hook=vision_hook),
+            ImageParser(vision_hook=effective_vision_hook),
         ]
         for parser in default_parsers:
             for ext in parser.SUPPORTED_EXTENSIONS:

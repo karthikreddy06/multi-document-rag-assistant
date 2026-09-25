@@ -53,11 +53,13 @@ class ImageParser(BaseParser):
         image_info = self._read_image_metadata(file_path)
 
         # If a vision hook is available, use it for richer text extraction
+        is_placeholder = True
         if self._vision_hook is not None:
             try:
                 extracted_text = self._vision_hook(file_path)
                 if extracted_text and extracted_text.strip():
                     content = extracted_text.strip()
+                    is_placeholder = False
                     logger.info(f"Vision hook produced {len(content)} chars for '{original_filename}'")
                 else:
                     content = self._build_placeholder(original_filename, image_info)
@@ -80,10 +82,11 @@ class ImageParser(BaseParser):
             image_height=image_info.get("height"),
             image_mode=image_info.get("mode"),
             is_image=True,
-            is_placeholder=(self._vision_hook is None),
+            is_placeholder=is_placeholder,
         )
 
-        logger.info(f"ImageParser: indexed '{original_filename}' as descriptive placeholder.")
+        status_desc = "rich vision content" if not is_placeholder else "descriptive placeholder"
+        logger.info(f"ImageParser: indexed '{original_filename}' as {status_desc}.")
         return [Document(page_content=content, metadata=meta)]
 
     def _read_image_metadata(self, file_path: Path) -> dict:
