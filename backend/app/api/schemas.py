@@ -82,6 +82,7 @@ class DocumentInfo(BaseModel):
     status: Optional[str] = Field(default="ready", description="Document status")
     created_at: Optional[str] = Field(None, description="Upload timestamp in UTC ISO-8601")
     storage_path: Optional[str] = Field(None, description="Safe storage path")
+    processing_version: Optional[int] = Field(default=1, description="Pipeline processing version")
 
 
 class DocumentsResponse(BaseModel):
@@ -118,6 +119,7 @@ class DocumentRecordResponse(BaseModel):
     storage_path: Optional[str] = Field(None, description="Relative or safe storage path")
     status: str = Field(..., description="Processing status: pending, processing, ready, failed")
     error_message: Optional[str] = Field(None, description="Safe error message on failure")
+    processing_version: Optional[int] = Field(default=1, description="Pipeline processing version")
     created_at: str = Field(..., description="Creation timestamp in UTC ISO-8601")
     attached_at: Optional[str] = Field(None, description="Timestamp when attached to chat")
 

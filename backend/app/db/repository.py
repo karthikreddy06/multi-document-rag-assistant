@@ -350,6 +350,7 @@ def create_document(
     status: str = "pending",
     error_message: Optional[str] = None,
     document_id: Optional[str] = None,
+    processing_version: Optional[int] = None,
     conn: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """
@@ -362,14 +363,15 @@ def create_document(
     doc_id = document_id or f"doc_{uuid.uuid4().hex[:16]}"
     now = _now_utc_iso()
     uid = user_id or "legacy_user"
+    pv = processing_version if processing_version is not None else getattr(settings, "processing_version", 2)
 
     with _managed_connection(conn) as c:
         c.execute(
             """
             INSERT INTO documents (
                 id, user_id, filename, file_hash, file_size, page_count,
-                chunk_count, storage_path, status, error_message, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                chunk_count, storage_path, status, error_message, processing_version, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 doc_id,
@@ -382,6 +384,7 @@ def create_document(
                 storage_path,
                 status,
                 error_message,
+                pv,
                 now,
             ),
         )
@@ -430,10 +433,11 @@ def update_document_status(
     chunk_count: Optional[int] = None,
     error_message: Optional[str] = None,
     storage_path: Optional[str] = None,
+    processing_version: Optional[int] = None,
     user_id: Optional[str] = None,
     conn: Optional[Any] = None,
 ) -> Optional[Dict[str, Any]]:
-    """Update processing status, counts, and error details of an indexed document."""
+    """Update processing status, counts, processing_version, and error details of an indexed document."""
     if status not in VALID_DOCUMENT_STATUSES:
         raise ValueError(f"Invalid status '{status}'. Must be one of {VALID_DOCUMENT_STATUSES}")
 
@@ -453,6 +457,9 @@ def update_document_status(
         if storage_path is not None:
             updates.append("storage_path = ?")
             params.append(storage_path)
+        if processing_version is not None:
+            updates.append("processing_version = ?")
+            params.append(processing_version)
 
         params.append(document_id)
         if user_id:
@@ -614,6 +621,7 @@ def list_chat_documents(
                 d.storage_path,
                 d.status,
                 d.error_message,
+                d.processing_version,
                 d.created_at,
                 cd.created_at as attached_at
             FROM chat_documents cd

@@ -195,6 +195,7 @@ def get_documents(
                         status=doc.get("status", "ready"),
                         created_at=doc.get("created_at"),
                         storage_path=doc.get("storage_path"),
+                        processing_version=doc.get("processing_version", 1),
                     )
                 )
             return DocumentsResponse(
@@ -894,19 +895,29 @@ def upload_document_to_chat(
         storage_path = safe_rel_path
 
     # 7. Check if document record already exists in catalog for THIS authenticated user
+    current_version = getattr(settings, "processing_version", 2)
     existing_doc = repository.get_document_by_hash(file_hash, user_id=user_id)
     if existing_doc is not None:
         doc_id = existing_doc["id"]
-        repository.attach_document_to_chat(chat_id, doc_id, user_id=user_id)
+        doc_version = existing_doc.get("processing_version") or 1
 
-        # If already ready, reuse without reprocessing
-        if existing_doc["status"] == "ready":
+        # If already ready AND processed with current (or newer) pipeline version: reuse without reprocessing
+        if existing_doc["status"] == "ready" and doc_version >= current_version:
+            repository.attach_document_to_chat(chat_id, doc_id, user_id=user_id)
             attached_docs = repository.list_chat_documents(chat_id, user_id=user_id)
             attached_rec = next((d for d in attached_docs if d["id"] == doc_id), existing_doc)
             return DocumentUploadResponse(
                 message="Existing document attached to chat without reprocessing.",
                 document=DocumentRecordResponse(**attached_rec),
             )
+
+        # Otherwise (doc_version < current_version or status != "ready"):
+        # Attach to chat and reprocess with updated pipeline version
+        repository.attach_document_to_chat(chat_id, doc_id, user_id=user_id)
+        try:
+            rag_app.vector_store.delete_by_document_id(doc_id, user_id=user_id)
+        except Exception as ve:
+            logger.warning(f"Could not purge old vector chunks for reprocessed document '{doc_id}': {ve}")
     else:
         # Check if already present in vector store for THIS user
         indexed_files = rag_app.vector_store.get_indexed_files(user_id=user_id)
@@ -915,24 +926,48 @@ def upload_document_to_chat(
                 where={"$and": [{"file_hash": file_hash}, {"user_id": user_id}]}
             )
             cnt = len(res.get("ids", []))
-            new_doc = repository.create_document(
-                document_id=deterministic_doc_id,
-                filename=safe_name,
-                file_hash=file_hash,
-                file_size=file_size,
-                chunk_count=cnt,
-                storage_path=storage_path,
-                status="ready",
-                user_id=user_id,
-            )
-            doc_id = new_doc["id"]
-            repository.attach_document_to_chat(chat_id, doc_id, user_id=user_id)
-            attached_docs = repository.list_chat_documents(chat_id, user_id=user_id)
-            attached_rec = next((d for d in attached_docs if d["id"] == doc_id), new_doc)
-            return DocumentUploadResponse(
-                message="Document registered from existing vector store and attached to chat.",
-                document=DocumentRecordResponse(**attached_rec),
-            )
+            metadatas = res.get("metadatas", []) or []
+            existing_ver = 1
+            if metadatas and metadatas[0]:
+                existing_ver = metadatas[0].get("processing_version", 1)
+
+            if existing_ver >= current_version:
+                new_doc = repository.create_document(
+                    document_id=deterministic_doc_id,
+                    filename=safe_name,
+                    file_hash=file_hash,
+                    file_size=file_size,
+                    chunk_count=cnt,
+                    storage_path=storage_path,
+                    status="ready",
+                    processing_version=existing_ver,
+                    user_id=user_id,
+                )
+                doc_id = new_doc["id"]
+                repository.attach_document_to_chat(chat_id, doc_id, user_id=user_id)
+                attached_docs = repository.list_chat_documents(chat_id, user_id=user_id)
+                attached_rec = next((d for d in attached_docs if d["id"] == doc_id), new_doc)
+                return DocumentUploadResponse(
+                    message="Document registered from existing vector store and attached to chat.",
+                    document=DocumentRecordResponse(**attached_rec),
+                )
+            else:
+                try:
+                    rag_app.vector_store.delete_by_filename(safe_name, user_id=user_id)
+                except Exception as ve:
+                    logger.warning(f"Could not delete stale vector chunks for '{safe_name}': {ve}")
+                new_doc = repository.create_document(
+                    document_id=deterministic_doc_id,
+                    filename=safe_name,
+                    file_hash=file_hash,
+                    file_size=file_size,
+                    storage_path=storage_path,
+                    status="pending",
+                    processing_version=current_version,
+                    user_id=user_id,
+                )
+                doc_id = new_doc["id"]
+                repository.attach_document_to_chat(chat_id, doc_id, user_id=user_id)
         else:
             # Register new pending document for authenticated user
             new_doc = repository.create_document(
@@ -942,6 +977,7 @@ def upload_document_to_chat(
                 file_size=file_size,
                 storage_path=storage_path,
                 status="pending",
+                processing_version=current_version,
                 user_id=user_id,
             )
             doc_id = new_doc["id"]
@@ -956,6 +992,7 @@ def upload_document_to_chat(
             document_id=doc_id,
             file_hash=file_hash,
             user_id=user_id,
+            processing_version=current_version,
         )
         ready_doc = repository.update_document_status(
             doc_id,
@@ -963,6 +1000,7 @@ def upload_document_to_chat(
             page_count=ingest_res.get("page_count", 0),
             chunk_count=ingest_res.get("chunk_count", 0),
             storage_path=safe_rel_path,
+            processing_version=current_version,
             user_id=user_id,
         )
         attached_docs = repository.list_chat_documents(chat_id, user_id=user_id)

@@ -64,6 +64,9 @@ class Settings(BaseSettings):
     chunk_size: int = Field(default=800, alias="CHUNK_SIZE")
     chunk_overlap: int = Field(default=100, alias="CHUNK_OVERLAP")
 
+    # Ingestion & Processing Pipeline Version
+    processing_version: int = Field(default=2, alias="PROCESSING_VERSION")
+
     # Retrieval settings
     top_k: int = Field(default=3, alias="TOP_K")
 

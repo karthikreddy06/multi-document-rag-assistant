@@ -55,6 +55,7 @@ CREATE TABLE IF NOT EXISTS documents (
     storage_path TEXT,
     status TEXT NOT NULL,
     error_message TEXT,
+    processing_version INTEGER DEFAULT 1,
     created_at TEXT NOT NULL,
     UNIQUE(user_id, file_hash)
 );
@@ -323,11 +324,18 @@ def _init_sqlite_db(custom_path: Optional[str | Path] = None) -> None:
                 conn.execute("DROP TABLE documents")
                 conn.execute("ALTER TABLE documents_migrated RENAME TO documents")
 
+            # Check if 'processing_version' exists in 'documents'
+            doc_cols_now = [c[1] for c in conn.execute("PRAGMA table_info(documents)").fetchall()]
+            if "processing_version" not in doc_cols_now:
+                conn.execute("ALTER TABLE documents ADD COLUMN processing_version INTEGER DEFAULT 1")
+                conn.execute("UPDATE documents SET processing_version = 1 WHERE processing_version IS NULL")
+
             # Establish indexes
             conn.execute("CREATE INDEX IF NOT EXISTS idx_users_email ON users(email)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_chats_user_id ON chats(user_id)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_documents_user_id ON documents(user_id)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_documents_file_hash ON documents(file_hash)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_documents_processing_version ON documents(processing_version)")
 
             user_count = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
             chat_count = conn.execute("SELECT COUNT(*) FROM chats").fetchone()[0]
@@ -403,6 +411,7 @@ def _init_postgres_db() -> None:
                             storage_path TEXT,
                             status TEXT NOT NULL CHECK (status IN ('pending', 'processing', 'ready', 'failed')),
                             error_message TEXT,
+                            processing_version INTEGER NOT NULL DEFAULT 1,
                             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                             CONSTRAINT uq_user_document_hash UNIQUE (user_id, file_hash)
                         );
@@ -424,6 +433,7 @@ def _init_postgres_db() -> None:
                         CREATE INDEX IF NOT EXISTS idx_chats_updated_at ON chats(updated_at DESC);
                         CREATE INDEX IF NOT EXISTS idx_documents_user_id ON documents(user_id);
                         CREATE INDEX IF NOT EXISTS idx_documents_file_hash ON documents(file_hash);
+                        CREATE INDEX IF NOT EXISTS idx_documents_processing_version ON documents(processing_version);
                         CREATE INDEX IF NOT EXISTS idx_chat_documents_chat_id ON chat_documents(chat_id);
                         CREATE INDEX IF NOT EXISTS idx_chat_documents_document_id ON chat_documents(document_id);
                         CREATE INDEX IF NOT EXISTS idx_messages_chat_id ON messages(chat_id);
@@ -433,6 +443,23 @@ def _init_postgres_db() -> None:
                 logger.info(f"PostgreSQL tables initialized successfully: {missing_tables}")
             else:
                 logger.info("Database verification: All required PostgreSQL tables verified (users, chats, documents, chat_documents, messages).")
+
+            # Check and apply processing_version column migration if needed
+            try:
+                cur.execute(
+                    """
+                    SELECT column_name FROM information_schema.columns 
+                    WHERE table_schema = 'public' 
+                      AND table_name = 'documents' 
+                      AND column_name = 'processing_version';
+                    """
+                )
+                if not cur.fetchone():
+                    logger.info("Migrating PostgreSQL documents table: adding processing_version column...")
+                    cur.execute("ALTER TABLE documents ADD COLUMN IF NOT EXISTS processing_version INTEGER DEFAULT 1;")
+                    cur.execute("CREATE INDEX IF NOT EXISTS idx_documents_processing_version ON documents(processing_version);")
+            except Exception as col_err:
+                logger.warning(f"Could not verify or migrate processing_version in PostgreSQL: {col_err}")
 
             # 3. Safe diagnostic counts
             cur.execute("SELECT COUNT(*) AS count FROM users")

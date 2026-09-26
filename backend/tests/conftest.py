@@ -32,6 +32,8 @@ def default_sqlite_for_tests(monkeypatch, request):
         yield
         return
     monkeypatch.setattr(settings, "database_url", None)
+    from app.db.database import init_db
+    init_db()
     yield
 
 
@@ -43,7 +45,7 @@ def auto_auth_for_legacy_tests(request):
     test_user_isolation run against the real JWT authentication layer.
     """
     mod_name = request.module.__name__
-    if any(k in mod_name for k in ("test_auth", "test_user_isolation", "frontend_auth", "persistence", "file_library", "conversion", "smoke")):
+    if any(k in mod_name for k in ("test_auth", "test_user_isolation", "frontend_auth", "persistence", "file_library", "conversion", "smoke", "processing_version", "dedup")):
         yield
         return
 

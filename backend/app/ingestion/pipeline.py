@@ -117,12 +117,14 @@ class IngestionPipeline:
         document_id: str,
         file_hash: Optional[str] = None,
         user_id: Optional[str] = None,
+        processing_version: Optional[int] = None,
     ) -> Dict[str, Any]:
         """
         Ingest an uploaded document of any supported format, preserving original
-        filename, user_id, and document_id metadata.
+        filename, user_id, document_id, and processing_version metadata.
         """
         path = Path(file_path).resolve()
+        pv = processing_version if processing_version is not None else getattr(settings, "processing_version", 2)
 
         try:
             documents = self.parser_registry.parse(
@@ -143,6 +145,7 @@ class IngestionPipeline:
             doc.metadata["filename"] = original_filename
             doc.metadata["document_id"] = document_id
             doc.metadata["file_hash"] = resolved_hash
+            doc.metadata["processing_version"] = pv
             if user_id:
                 doc.metadata["user_id"] = user_id
 
@@ -151,11 +154,12 @@ class IngestionPipeline:
             logger.warning(f"No chunks generated from uploaded file {original_filename}.")
             return {"page_count": len(documents), "chunk_count": 0}
 
-        # Ensure every chunk carries document_id, user_id, and clean original_filename
+        # Ensure every chunk carries document_id, user_id, clean original_filename, and processing_version
         for c in chunks:
             c.metadata["document_id"] = document_id
             c.metadata["filename"] = original_filename
             c.metadata["file_hash"] = resolved_hash
+            c.metadata["processing_version"] = pv
             if user_id:
                 c.metadata["user_id"] = user_id
 
