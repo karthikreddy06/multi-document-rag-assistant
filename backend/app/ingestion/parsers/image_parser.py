@@ -7,7 +7,7 @@ A pluggable vision/OCR hook is provided for future extension.
 """
 
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Union
 
 from app.ingestion.parsers.base import BaseParser
 from app.models import Document
@@ -40,10 +40,11 @@ class ImageParser(BaseParser):
 
     def parse(
         self,
-        file_path: Path,
+        file_path: Union[Path, str],
         original_filename: str,
         file_hash: str,
     ) -> List[Document]:
+        file_path = Path(file_path)
         if not file_path.exists():
             raise FileNotFoundError(f"Image file not found: {file_path}")
 

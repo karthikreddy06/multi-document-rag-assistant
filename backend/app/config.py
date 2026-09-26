@@ -24,7 +24,8 @@ class Settings(BaseSettings):
     llm_api_key: str = Field(default="", alias="LLM_API_KEY")
     llm_num_predict: int = Field(default=120, alias="LLM_NUM_PREDICT")
     llm_num_ctx: int = Field(default=1536, alias="LLM_NUM_CTX")
-    vision_model: str = Field(default="qwen/qwen3.8-27b", alias="VISION_MODEL")
+    vision_provider: str = Field(default="openrouter", alias="VISION_PROVIDER")
+    vision_model: str = Field(default="stealth/space-bunny-alpha", alias="VISION_MODEL")
 
     embedding_provider: str = Field(default="ollama", alias="EMBEDDING_PROVIDER")
     embedding_model: str = Field(default="nomic-embed-text", alias="EMBEDDING_MODEL")
@@ -34,6 +35,7 @@ class Settings(BaseSettings):
 
     groq_api_key: str = Field(default="", alias="GROQ_API_KEY")
     gemini_api_key: str = Field(default="", alias="GEMINI_API_KEY")
+    openrouter_api_key: str = Field(default="", alias="OPENROUTER_API_KEY")
 
     ollama_host: str = Field(default="http://localhost:11434", alias="OLLAMA_HOST")
     ollama_timeout: float = Field(default=180.0, alias="OLLAMA_TIMEOUT")
@@ -184,8 +186,34 @@ class Settings(BaseSettings):
         return self.llm_model
 
     @property
+    def effective_vision_provider(self) -> str:
+        if self.vision_provider and self.vision_provider.strip():
+            return self.vision_provider.lower().strip()
+        if self.openrouter_api_key:
+            return "openrouter"
+        if self.gemini_api_key:
+            return "gemini"
+        return "openrouter"
+
+    @property
     def effective_vision_model(self) -> str:
-        return self.vision_model or "qwen/qwen3.8-27b"
+        p = self.effective_vision_provider
+        if self.vision_model and self.vision_model != "qwen/qwen3.8-27b":
+            return self.vision_model
+        if p == "openrouter":
+            return "stealth/space-bunny-alpha"
+        if p == "gemini":
+            return "gemini-1.5-flash"
+        return self.vision_model or "stealth/space-bunny-alpha"
+
+    @property
+    def effective_vision_api_key(self) -> str:
+        p = self.effective_vision_provider
+        if p == "openrouter":
+            return self.openrouter_api_key or self.gemini_api_key or self.groq_api_key
+        if p == "gemini":
+            return self.gemini_api_key or self.openrouter_api_key or self.groq_api_key
+        return self.groq_api_key or self.openrouter_api_key or self.gemini_api_key
 
     @property
     def effective_embedding_model(self) -> str:

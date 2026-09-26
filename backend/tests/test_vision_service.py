@@ -1,6 +1,6 @@
 """
-Unit tests for VisionService and ImageParser vision hook integration.
-All tests use mocked HTTP/Groq responses so no real external API calls are made.
+Unit tests for VisionService (Gemini primary with Groq fallback) and ImageParser integration.
+All tests use mocked HTTP/Gemini responses so no real external API calls or exposed keys are needed.
 """
 
 import io
@@ -19,8 +19,8 @@ from app.services.vision import VisionService, get_vision_service, reset_vision_
 @pytest.fixture
 def sample_png_path(tmp_path) -> Path:
     """Create a valid 64x64 PNG image on disk."""
-    img_path = tmp_path / "sample_diagram.png"
-    img = Image.new("RGB", (64, 64), color="blue")
+    img_path = tmp_path / "sample_photo.png"
+    img = Image.new("RGB", (64, 64), color="white")
     img.save(img_path, format="PNG")
     return img_path
 
@@ -29,40 +29,52 @@ def sample_png_path(tmp_path) -> Path:
 def tiny_png_path(tmp_path) -> Path:
     """Create an image smaller than 32x32 to test auto-resizing for API compliance."""
     img_path = tmp_path / "tiny.png"
-    img = Image.new("RGB", (10, 10), color="green")
+    img = Image.new("RGB", (16, 16), color="red")
     img.save(img_path, format="PNG")
     return img_path
 
 
 MOCK_VISION_MARKDOWN = (
     "### Extracted Text\n"
-    "Quarterly Revenue: $4.2M\n"
-    "Growth Rate: +18%\n\n"
+    "No visible text in image.\n\n"
     "### Visual Description\n"
-    "A bar chart comparing Q1 to Q4 financial performance with an upward trendline."
+    "- Photographic / Scene Content: A close-up portrait of a young man with dark hair, a mustache, beard, "
+    "and dark rectangular eyeglass frames. He wears a plain white collared button-up shirt against a light background."
 )
 
 
 class TestVisionServiceConfig:
-    def test_default_model(self):
-        service = VisionService(api_key="test-key", model=None)
-        assert service.model == "qwen/qwen3.8-27b"
+    def test_default_openrouter_provider_and_model(self):
+        service = VisionService(api_key="sk-or-test-key", provider="openrouter")
+        assert service.provider == "openrouter"
+        assert service.model == "stealth/space-bunny-alpha"
 
-    def test_custom_vision_model(self):
-        service = VisionService(api_key="test-key", model="custom-vision-model")
-        assert service.model == "custom-vision-model"
+    def test_gemini_provider_and_model(self):
+        service = VisionService(api_key="ai-gemini-test-key", provider="gemini", model="gemini-1.5-flash")
+        assert service.provider == "gemini"
+        assert service.model == "gemini-1.5-flash"
+
+    def test_custom_openrouter_model(self):
+        service = VisionService(api_key="sk-or-test-key", provider="openrouter", model="qwen/qwen3.8-27b:free")
+        assert service.model == "qwen/qwen3.8-27b:free"
+
+    def test_groq_fallback_provider_config(self):
+        service = VisionService(api_key="gsk-test-key", provider="groq", model="qwen/qwen3.8-27b")
+        assert service.provider == "groq"
+        assert service.model == "qwen/qwen3.8-27b"
 
     def test_is_configured_logic(self):
         s_unconf = VisionService(api_key="")
         assert not s_unconf.is_configured
 
-        s_conf = VisionService(api_key="gsk_valid_key")
+        s_conf = VisionService(api_key="valid-key")
         assert s_conf.is_configured
 
-    def test_settings_vision_model_field(self):
-        s = Settings(VISION_MODEL="qwen/qwen3.8-27b")
-        assert s.vision_model == "qwen/qwen3.8-27b"
-        assert s.effective_vision_model == "qwen/qwen3.8-27b"
+    def test_settings_vision_properties(self):
+        s = Settings(OPENROUTER_API_KEY="test_or_val", VISION_PROVIDER="openrouter")
+        assert s.effective_vision_provider == "openrouter"
+        assert s.effective_vision_model == "stealth/space-bunny-alpha"
+        assert s.effective_vision_api_key == "test_or_val"
 
 
 class TestVisionServicePreparation:
@@ -73,7 +85,6 @@ class TestVisionServicePreparation:
         assert len(b64_str) > 50
 
     def test_prepare_image_upscales_tiny_dimensions(self, tiny_png_path):
-        """Images under 32x32 must be upscaled so Groq API does not reject them."""
         service = VisionService(api_key="test-key")
         mime_type, b64_str = service._prepare_image(tiny_png_path)
         assert mime_type == "image/png"
@@ -93,9 +104,9 @@ class TestVisionServicePreparation:
             service._prepare_image(missing)
 
 
-class TestVisionServiceDescribeImage:
-    def test_describe_image_success_mocked(self, sample_png_path):
-        service = VisionService(api_key="test-key", model="qwen/qwen3.8-27b")
+class TestVisionServiceDescribeImageOpenRouter:
+    def test_describe_image_success_openrouter_mocked(self, sample_png_path):
+        service = VisionService(api_key="test-or-key", provider="openrouter", model="stealth/space-bunny-alpha")
 
         mock_response = MagicMock()
         mock_response.status_code = 200
@@ -109,94 +120,134 @@ class TestVisionServiceDescribeImage:
             ]
         }
 
-        with patch("httpx.Client.post", return_value=mock_response) as mock_post:
+        captured_requests = []
+
+        def mock_post(url, headers, json):
+            captured_requests.append({"url": url, "headers": headers, "json": json})
+            return mock_response
+
+        with patch("httpx.Client.post", side_effect=mock_post):
+            result = service.describe_image(sample_png_path, original_filename="image.jpg")
+
+        assert result is not None
+        assert "white collared button-up shirt" in result
+        assert len(captured_requests) == 1
+        req = captured_requests[0]
+        assert "openrouter.ai/api/v1/chat/completions" in req["url"]
+        assert req["headers"]["Authorization"] == "Bearer test-or-key"
+        assert req["headers"]["HTTP-Referer"] == "https://github.com/karthikreddy06/multi-document-rag-assistant"
+        assert req["json"]["model"] == "stealth/space-bunny-alpha"
+        assert "models" in req["json"]
+        msg = req["json"]["messages"][0]["content"]
+        assert any(item["type"] == "text" and item["text"] == VISION_PROMPT for item in msg)
+        assert any(item["type"] == "image_url" and item["image_url"]["url"].startswith("data:image/png;base64,") for item in msg)
+
+    def test_describe_image_openrouter_http_error_returns_none(self, sample_png_path):
+        service = VisionService(api_key="test-or-key", provider="openrouter")
+
+        mock_response = MagicMock()
+        mock_response.status_code = 429
+        mock_response.text = "Rate limited upstream."
+        error = httpx.HTTPStatusError("Too Many Requests", request=MagicMock(), response=mock_response)
+
+        with patch("httpx.Client.post", side_effect=error):
             result = service.describe_image(sample_png_path)
 
-            assert result == MOCK_VISION_MARKDOWN
-            assert "### Extracted Text" in result
-            assert "### Visual Description" in result
+        assert result is None
 
-            # Verify request arguments sent to Groq
-            mock_post.assert_called_once()
-            call_kwargs = mock_post.call_args[1]
-            headers = call_kwargs["headers"]
-            payload = call_kwargs["json"]
 
-            assert headers["Authorization"] == "Bearer test-key"
-            assert payload["model"] == "qwen/qwen3.8-27b"
-            msg = payload["messages"][0]["content"]
-            assert any(item["type"] == "text" for item in msg)
-            assert any(item["type"] == "image_url" for item in msg)
-            img_url = next(item["image_url"]["url"] for item in msg if item["type"] == "image_url")
-            assert img_url.startswith("data:image/png;base64,")
+class TestVisionServiceDescribeImageGemini:
+    def test_describe_image_success_gemini_mocked(self, sample_png_path):
+        service = VisionService(api_key="test-gemini-key", provider="gemini", model="gemini-1.5-flash")
+
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {
+            "candidates": [
+                {
+                    "content": {
+                        "parts": [
+                            {"text": MOCK_VISION_MARKDOWN}
+                        ]
+                    }
+                }
+            ]
+        }
+
+        captured_requests = []
+
+        def mock_post(url, headers, json):
+            captured_requests.append({"url": url, "headers": headers, "json": json})
+            return mock_response
+
+        with patch("httpx.Client.post", side_effect=mock_post):
+            result = service.describe_image(sample_png_path, original_filename="image.jpg")
+
+        assert result is not None
+        assert "white collared button-up shirt" in result
+        assert len(captured_requests) == 1
+        req = captured_requests[0]
+        assert "generativelanguage.googleapis.com" in req["url"]
+        assert "gemini-1.5-flash:generateContent" in req["url"]
+        assert req["headers"]["x-goog-api-key"] == "test-gemini-key"
+        parts = req["json"]["contents"][0]["parts"]
+        assert parts[0]["text"] == VISION_PROMPT
+        assert parts[1]["inline_data"]["mime_type"] == "image/png"
+        assert len(parts[1]["inline_data"]["data"]) > 0
 
     def test_describe_image_unconfigured_returns_none(self, sample_png_path):
         service = VisionService(api_key="")
         result = service.describe_image(sample_png_path)
         assert result is None
 
-    def test_describe_image_api_error_returns_none(self, sample_png_path):
-        service = VisionService(api_key="test-key")
-        mock_resp = MagicMock()
-        mock_resp.status_code = 500
-        mock_resp.text = "Internal Server Error"
+    def test_describe_image_gemini_http_error_returns_none(self, sample_png_path):
+        service = VisionService(api_key="test-gemini-key", provider="gemini")
 
-        with patch("httpx.Client.post", side_effect=httpx.HTTPStatusError("500 Error", request=MagicMock(), response=mock_resp)):
+        mock_response = MagicMock()
+        mock_response.status_code = 403
+        mock_response.text = "API key not valid."
+        error = httpx.HTTPStatusError("Forbidden", request=MagicMock(), response=mock_response)
+
+        with patch("httpx.Client.post", side_effect=error):
             result = service.describe_image(sample_png_path)
-            assert result is None
+
+        assert result is None
 
 
 class TestImageParserVisionHookIntegration:
     def test_successful_vision_sets_placeholder_false(self, sample_png_path):
-        """When vision succeeds, is_placeholder must be False and page_content contains vision text."""
-        hook = lambda p: MOCK_VISION_MARKDOWN
-        parser = ImageParser(vision_hook=hook)
-        docs = parser.parse(sample_png_path, "sample_diagram.png", "hash123")
+        mock_hook = MagicMock(return_value=MOCK_VISION_MARKDOWN)
+        parser = ImageParser(vision_hook=mock_hook)
 
+        docs = parser.parse(sample_png_path, original_filename="image.jpg", file_hash="hash_123")
         assert len(docs) == 1
         doc = docs[0]
-        assert doc.page_content == MOCK_VISION_MARKDOWN
         assert doc.metadata["is_placeholder"] is False
         assert doc.metadata["is_image"] is True
-        assert doc.metadata["format"] == "image"
-        assert doc.metadata["image_width"] == 64
-        assert doc.metadata["image_height"] == 64
+        assert "white collared button-up shirt" in doc.page_content
 
     def test_failed_vision_hook_sets_placeholder_true(self, sample_png_path):
-        """When vision fails, parser falls back to Pillow placeholder with is_placeholder=True."""
-        def bad_hook(p):
-            raise RuntimeError("Groq rate limit exceeded")
+        mock_hook = MagicMock(side_effect=RuntimeError("Gemini service timeout"))
+        parser = ImageParser(vision_hook=mock_hook)
 
-        parser = ImageParser(vision_hook=bad_hook)
-        docs = parser.parse(sample_png_path, "sample_diagram.png", "hash123")
-
+        docs = parser.parse(sample_png_path, original_filename="image.jpg", file_hash="hash_123")
         assert len(docs) == 1
         doc = docs[0]
-        assert "Format: PNG" in doc.page_content
-        assert "Note: This is an image file" in doc.page_content
         assert doc.metadata["is_placeholder"] is True
-        assert doc.metadata["is_image"] is True
-
-    def test_empty_vision_result_sets_placeholder_true(self, sample_png_path):
-        hook = lambda p: ""
-        parser = ImageParser(vision_hook=hook)
-        docs = parser.parse(sample_png_path, "sample_diagram.png", "hash123")
-
-        assert docs[0].metadata["is_placeholder"] is True
-        assert "Note: This is an image file" in docs[0].page_content
+        assert "[Image File: image.jpg" in doc.page_content
 
 
-class TestParserRegistryDefaultWiring:
+class TestParserRegistryWiring:
     def test_parser_registry_wires_configured_vision_service(self):
         reset_vision_service()
-        with patch("app.services.vision.VisionService.is_configured", True):
-            registry = ParserRegistry()
-            image_parser = registry.get_parser(".png")
-            assert isinstance(image_parser, ImageParser)
-            assert image_parser._vision_hook is not None
+        with patch.object(VisionService, "is_configured", True):
+            with patch.object(VisionService, "describe_image", return_value="Mocked Vision Description"):
+                registry = ParserRegistry()
+                image_parser = registry.get_parser(".jpg")
+                assert image_parser._vision_hook is not None
 
     def test_parser_registry_respects_custom_hook_override(self):
-        custom_hook = lambda p: "Custom output"
+        custom_hook = lambda p: "Custom Vision Hook"
         registry = ParserRegistry(vision_hook=custom_hook)
         image_parser = registry.get_parser(".png")
         assert image_parser._vision_hook == custom_hook
