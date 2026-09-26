@@ -6,7 +6,7 @@ and reusable FastAPI dependencies get_current_user and get_current_user_id.
 
 import re
 from typing import Any, Dict, Optional
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status, Query
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, EmailStr, Field, field_validator
 
@@ -134,6 +134,47 @@ async def get_current_user_id(
     Convenience dependency returning the string ID of the authenticated user.
     """
     return str(current_user["id"])
+
+
+async def get_current_user_from_header_or_query(
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
+    token: Optional[str] = Query(default=None, description="Access token via query param for direct download links"),
+) -> Dict[str, Any]:
+    """
+    Validates authentication token from either Authorization header or ?token= query parameter.
+    Enforces strict user verification and isolation.
+    """
+    raw_token = None
+    if credentials and credentials.credentials:
+        raw_token = credentials.credentials.strip()
+    elif token:
+        raw_token = token.strip()
+
+    if not raw_token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Authentication credentials were not provided.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    payload = decode_access_token(raw_token)
+    if not payload or "sub" not in payload:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired access token.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    user_id = payload["sub"]
+    user = repository.get_user_by_id(user_id)
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="User account no longer exists.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    return user
 
 
 # ==============================================================================

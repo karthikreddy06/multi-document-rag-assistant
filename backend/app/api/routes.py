@@ -45,7 +45,14 @@ from app.api.schemas import (
     ConversionRequest,
     ConversionTargetsResponse,
 )
-from app.api.auth import router as auth_router, get_current_user, get_current_user_id
+from app.api.auth import (
+    router as auth_router,
+    get_current_user,
+    get_current_user_id,
+    get_current_user_from_header_or_query,
+)
+from app.auth.security import create_access_token
+from app.retrieval.query_understanding import parse_conversion_request
 
 logger = setup_logger("api.routes")
 
@@ -288,7 +295,7 @@ def get_document(
 @app.get("/api/documents/{document_id}/download", tags=["Documents"])
 def download_document(
     document_id: str,
-    current_user: Dict[str, Any] = Depends(get_current_user),
+    current_user: Dict[str, Any] = Depends(get_current_user_from_header_or_query),
 ) -> Response:
     """
     Download original file payload verifying user ownership.
@@ -309,7 +316,7 @@ def download_document(
 @app.get("/api/documents/{document_id}/view", tags=["Documents"])
 def view_document(
     document_id: str,
-    current_user: Dict[str, Any] = Depends(get_current_user),
+    current_user: Dict[str, Any] = Depends(get_current_user_from_header_or_query),
 ) -> Response:
     """
     View file content inline where browser supported (PDF, text, images).
@@ -415,7 +422,8 @@ def convert_document(
     document_id: str,
     target_format: Optional[str] = None,
     payload: Optional[ConversionRequest] = None,
-    current_user: Dict[str, Any] = Depends(get_current_user),
+    current_user: Dict[str, Any] = Depends(get_current_user_from_header_or_query),
+    rag_app: RAGApplication = Depends(get_rag_app),
 ) -> Response:
     """Convert an existing document to a supported target format and return converted bytes."""
     user_id = str(current_user["id"])
@@ -438,6 +446,7 @@ def convert_document(
             source_bytes=source_bytes,
             source_filename=doc["filename"],
             target_format=tgt,
+            llm_generator=rag_app.generator if tgt == ".pptx" else None,
         )
     except UnsupportedConversionError as ue:
         raise HTTPException(status_code=400, detail=str(ue))
@@ -486,6 +495,42 @@ def chat(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Query string must not be empty.",
         )
+
+    # Check for natural language document conversion request
+    user_docs = repository.list_documents(user_id=user_id)
+    conv_info = parse_conversion_request(query, user_docs)
+    if conv_info:
+        if conv_info.clarification_needed:
+            return ChatResponse(answer=conv_info.clarification_needed, sources=[])
+        doc = conv_info.matched_document
+        source_bytes = _fetch_document_bytes(doc, user_id)
+        converted_bytes, out_filename, mime_type = DocumentConverter.convert(
+            source_bytes=source_bytes,
+            source_filename=doc["filename"],
+            target_format=conv_info.target_format,
+            llm_generator=rag_app.generator if conv_info.target_format == ".pptx" else None,
+        )
+        try:
+            storage = get_storage_service()
+            storage.upload_file(
+                file_bytes=converted_bytes,
+                filename=out_filename,
+                user_id=user_id,
+                document_id=f"converted_{doc['id']}",
+                content_type=mime_type,
+            )
+        except Exception as se:
+            logger.warning(f"Could not persist converted file in storage: {se}")
+
+        token = create_access_token({"sub": user_id})
+        clean_target = conv_info.target_format.lstrip(".")
+        download_url = f"/api/documents/{doc['id']}/convert?target_format={clean_target}&token={token}"
+        size_kb = round(len(converted_bytes) / 1024, 1)
+        ans = (
+            f"Successfully converted **{doc['filename']}** to **{out_filename}** ({size_kb} KB).\n\n"
+            f"[📥 Click here to download {out_filename}]({download_url})"
+        )
+        return ChatResponse(answer=ans, sources=[])
 
     try:
         user_where = {"user_id": user_id}
@@ -1069,6 +1114,46 @@ def chat_in_session(
     attached_docs = repository.list_chat_documents(chat_id, user_id=user_id)
     ready_docs = [d for d in attached_docs if d["status"] == "ready"]
 
+    # Check for natural language document conversion request
+    conv_info = parse_conversion_request(query, ready_docs)
+    if conv_info:
+        if conv_info.clarification_needed:
+            ans = conv_info.clarification_needed
+            repository.create_message(chat_id=chat_id, role="user", content=query, user_id=user_id)
+            repository.create_message(chat_id=chat_id, role="assistant", content=ans, sources_json=[], user_id=user_id)
+            return ChatResponse(answer=ans, sources=[])
+        doc = conv_info.matched_document
+        source_bytes = _fetch_document_bytes(doc, user_id)
+        converted_bytes, out_filename, mime_type = DocumentConverter.convert(
+            source_bytes=source_bytes,
+            source_filename=doc["filename"],
+            target_format=conv_info.target_format,
+            llm_generator=rag_app.generator if conv_info.target_format == ".pptx" else None,
+        )
+        try:
+            storage = get_storage_service()
+            storage.upload_file(
+                file_bytes=converted_bytes,
+                filename=out_filename,
+                user_id=user_id,
+                document_id=f"converted_{doc['id']}",
+                content_type=mime_type,
+            )
+        except Exception as se:
+            logger.warning(f"Could not persist converted file in storage: {se}")
+
+        token = create_access_token({"sub": user_id})
+        clean_target = conv_info.target_format.lstrip(".")
+        download_url = f"/api/documents/{doc['id']}/convert?target_format={clean_target}&token={token}"
+        size_kb = round(len(converted_bytes) / 1024, 1)
+        ans = (
+            f"Successfully converted **{doc['filename']}** to **{out_filename}** ({size_kb} KB).\n\n"
+            f"[📥 Click here to download {out_filename}]({download_url})"
+        )
+        repository.create_message(chat_id=chat_id, role="user", content=query, user_id=user_id)
+        repository.create_message(chat_id=chat_id, role="assistant", content=ans, sources_json=[], user_id=user_id)
+        return ChatResponse(answer=ans, sources=[])
+
     # If no ready documents are attached, return clean response and persist
     if not ready_docs:
         notice = "No ready documents are attached to this chat. Please upload and attach a PDF document before asking questions."
@@ -1217,6 +1302,72 @@ def chat_in_session_stream(
 
     attached_docs = repository.list_chat_documents(chat_id, user_id=user_id)
     ready_docs = [d for d in attached_docs if d["status"] == "ready"]
+
+    # Check for natural language document conversion request
+    conv_info = parse_conversion_request(query, ready_docs)
+    if conv_info:
+        def conversion_stream():
+            if conv_info.clarification_needed:
+                ans = conv_info.clarification_needed
+                repository.create_message(chat_id=chat_id, role="user", content=query, user_id=user_id)
+                repository.create_message(chat_id=chat_id, role="assistant", content=ans, sources_json=[], user_id=user_id)
+                yield f"data: {json.dumps({'type': 'token', 'token': ans})}\n\n"
+                yield f"data: {json.dumps({'type': 'sources', 'sources': []})}\n\n"
+                yield "data: [DONE]\n\n"
+                return
+
+            doc = conv_info.matched_document
+            doc_fn = doc.get("filename", "document")
+            intro_token = f"Converting **{doc_fn}** to {conv_info.target_label}..."
+            yield f"data: {json.dumps({'type': 'token', 'token': intro_token})}\n\n"
+
+            try:
+                source_bytes = _fetch_document_bytes(doc, user_id)
+                converted_bytes, out_filename, mime_type = DocumentConverter.convert(
+                    source_bytes=source_bytes,
+                    source_filename=doc["filename"],
+                    target_format=conv_info.target_format,
+                    llm_generator=rag_app.generator if conv_info.target_format == ".pptx" else None,
+                )
+                try:
+                    storage = get_storage_service()
+                    storage.upload_file(
+                        file_bytes=converted_bytes,
+                        filename=out_filename,
+                        user_id=user_id,
+                        document_id=f"converted_{doc['id']}",
+                        content_type=mime_type,
+                    )
+                except Exception as se:
+                    logger.warning(f"Could not persist converted file in storage: {se}")
+
+                token = create_access_token({"sub": user_id})
+                clean_target = conv_info.target_format.lstrip(".")
+                download_url = f"/api/documents/{doc['id']}/convert?target_format={clean_target}&token={token}"
+                size_kb = round(len(converted_bytes) / 1024, 1)
+
+                msg = (
+                    f"\n\nSuccessfully converted **{doc['filename']}** to **{out_filename}** ({size_kb} KB).\n\n"
+                    f"[📥 Click here to download {out_filename}]({download_url})"
+                )
+                yield f"data: {json.dumps({'type': 'token', 'token': msg})}\n\n"
+                repository.create_message(chat_id=chat_id, role="user", content=query, user_id=user_id)
+                repository.create_message(
+                    chat_id=chat_id,
+                    role="assistant",
+                    content=f"Successfully converted **{doc['filename']}** to **{out_filename}** ({size_kb} KB).\n\n[📥 Click here to download {out_filename}]({download_url})",
+                    sources_json=[],
+                    user_id=user_id,
+                )
+                yield f"data: {json.dumps({'type': 'sources', 'sources': []})}\n\n"
+                yield "data: [DONE]\n\n"
+            except Exception as e:
+                err_msg = f"\n\nConversion failed: {e}"
+                yield f"data: {json.dumps({'type': 'token', 'token': err_msg})}\n\n"
+                yield f"data: {json.dumps({'type': 'sources', 'sources': []})}\n\n"
+                yield "data: [DONE]\n\n"
+
+        return StreamingResponse(conversion_stream(), media_type="text/event-stream")
 
     if not ready_docs:
         notice = "No ready documents are attached to this chat. Please upload and attach a PDF document before asking questions."

@@ -7,8 +7,15 @@ and resolves follow-up references using recent conversation history.
 
 from dataclasses import dataclass, field
 from enum import Enum
+from pathlib import Path
 import re
 from typing import Any, Dict, List, Optional, Set, Tuple
+
+from app.services.converter import (
+    is_conversion_supported,
+    get_supported_targets,
+    SUPPORTED_CONVERSIONS,
+)
 
 
 class QueryIntent(str, Enum):
@@ -31,6 +38,7 @@ class QueryIntent(str, Enum):
     MULTI_DOCUMENT_QUERY = "multi_document_query" # Document-wide request spanning all/each attached files
     DOCUMENT_SUMMARY = "document_summary"    # Summary requested per attached document
     DOCUMENT_LIST_QUERY = "document_list_query"   # Query asking what files are attached to the session
+    CONVERSION_REQUEST = "conversion_request"    # Document file conversion request
 
 
 @dataclass
@@ -206,6 +214,17 @@ class QueryAnalyzer:
                 intent=QueryIntent.MULTI_DOCUMENT_QUERY,
                 aspects=[clean_q],
                 lines_per_doc=lines_per_doc,
+            )
+
+        # Step 0c: Check Document Conversion Request
+        conv_info = parse_conversion_request(clean_q, available_documents)
+        if conv_info:
+            return QueryAnalysis(
+                raw_query=query,
+                cleaned_query=clean_q,
+                intent=QueryIntent.CONVERSION_REQUEST,
+                aspects=[clean_q],
+                target_document_hint=conv_info.matched_document.get("filename") if conv_info.matched_document else None,
             )
 
         # Step 1: Check for conversation follow-up resolution first
@@ -986,3 +1005,237 @@ class ConversationContextResolver:
                 items.append(cleaned)
 
         return items
+
+
+# ==============================================================================
+# NATURAL LANGUAGE DOCUMENT CONVERSION PARSING
+# ==============================================================================
+
+@dataclass
+class ConversionRequestInfo:
+    """Structured details for a detected file conversion request."""
+    target_format: str                         # Normalized extension, e.g. ".docx", ".pptx", ".pdf", ".csv", ".xlsx"
+    target_label: str                          # Human-readable format name, e.g. "Word (.docx)", "PowerPoint (.pptx)"
+    source_filename_hint: Optional[str] = None # Filename mentioned in query
+    source_format_hint: Optional[str] = None   # Source extension hint, e.g. ".pdf"
+    matched_document: Optional[Dict[str, Any]] = None # The matched document dictionary
+    clarification_needed: Optional[str] = None # Explanation if ambiguous or invalid
+    is_valid: bool = True                      # Ready for immediate execution
+
+
+def parse_conversion_request(
+    query: str,
+    available_documents: Optional[List[Any]] = None,
+) -> Optional[ConversionRequestInfo]:
+    """
+    Analyzes whether a natural language query expresses intent to convert a document.
+    Examples:
+        - "Convert this PDF to Word"
+        - "Convert this document to PowerPoint"
+        - "Convert this Excel to CSV"
+        - "Convert appointment.png to PDF"
+        - "Export to PDF"
+        - "Turn this markdown into a docx"
+
+    Returns ConversionRequestInfo if conversion intent is recognized, else None.
+    """
+    if not query:
+        return None
+
+    clean_q = query.strip()
+    q_lower = clean_q.lower()
+
+    # 1. Negative filter: educational / coding questions without action context
+    is_howto = bool(re.search(
+        r"\b(?:how\s+(?:to|can\s+i|do\s+i)|python\s+code|code\s+to|script\s+to|syntax\s+for|library\s+to|explain\s+how)\b",
+        q_lower,
+    ))
+    has_action_context = bool(re.search(r"\b(?:this|my|attached|uploaded|current)\b", q_lower))
+    if is_howto and not has_action_context:
+        return None
+
+    # 2. Trigger detection
+    conversion_verb = bool(re.search(
+        r"\b(?:convert|change|transform|turn|export|download\s+as|save\s+as|"
+        r"make\s+(?:a\s+)?(?:pdf|word|pptx|powerpoint|presentation|excel|csv|slides?))\b",
+        q_lower,
+    ))
+    to_format_pattern = bool(re.search(
+        r"\b(?:to|into|as|in)\s+(?:a\s+)?(?:word|docx|doc|pdf|powerpoint|pptx|presentation|slides?|excel|xlsx|spreadsheet|csv)\b",
+        q_lower,
+    ))
+    if not (conversion_verb or to_format_pattern):
+        return None
+
+    # 3. Detect Target Format
+    target_ext: Optional[str] = None
+    target_label: Optional[str] = None
+
+    target_rules = [
+        # Word / DOCX
+        (r"\b(?:to|into|as|in)\s+(?:a\s+)?(?:word(?:\s+doc(?:ument)?)?|docx|doc)\b|\b(?:save\s+as|download\s+as|export\s+as|export\s+to|make\s+a)\s+(?:word|docx)\b|\bconvert\s+(?:.*?\s+)?to\s+word\b", ".docx", "Word (.docx)"),
+        # PowerPoint / PPTX
+        (r"\b(?:to|into|as|in)\s+(?:a\s+)?(?:powerpoint(?:\s+presentation)?|presentation|pptx|ppt|slides?)\b|\b(?:save\s+as|download\s+as|export\s+as|export\s+to|make\s+a)\s+(?:powerpoint|pptx|presentation|slides?)\b|\bconvert\s+(?:.*?\s+)?to\s+(?:powerpoint|pptx|presentation|slides?)\b", ".pptx", "PowerPoint (.pptx)"),
+        # PDF
+        (r"\b(?:to|into|as|in)\s+(?:a\s+)?pdf\b|\b(?:save\s+as|download\s+as|export\s+as|export\s+to|make\s+a)\s+pdf\b|\bconvert\s+(?:.*?\s+)?to\s+pdf\b", ".pdf", "PDF (.pdf)"),
+        # CSV
+        (r"\b(?:to|into|as|in)\s+(?:a\s+)?csv\b|\b(?:save\s+as|download\s+as|export\s+as|export\s+to|make\s+a)\s+csv\b|\bconvert\s+(?:.*?\s+)?to\s+csv\b", ".csv", "CSV (.csv)"),
+        # Excel / XLSX
+        (r"\b(?:to|into|as|in)\s+(?:a\s+)?(?:excel(?:\s+sheet|\s+spreadsheet)?|spreadsheet|xlsx|xls)\b|\b(?:save\s+as|download\s+as|export\s+as|export\s+to|make\s+a)\s+(?:excel|xlsx)\b|\bconvert\s+(?:.*?\s+)?to\s+excel\b", ".xlsx", "Excel (.xlsx)"),
+    ]
+
+    for pat, ext, lbl in target_rules:
+        if re.search(pat, q_lower):
+            target_ext = ext
+            target_label = lbl
+            break
+
+    if not target_ext:
+        return None
+
+    # 4. Detect Source Format Hint
+    source_format_hint: Optional[str] = None
+    if re.search(r"\b(?:this|my|the|from)?\s*pdf\b", q_lower) and target_ext != ".pdf":
+        source_format_hint = ".pdf"
+    elif re.search(r"\b(?:this|my|the|from)?\s*(?:word|docx|doc)\b", q_lower) and target_ext != ".docx":
+        source_format_hint = ".docx"
+    elif re.search(r"\b(?:this|my|the|from)?\s*(?:powerpoint|pptx|ppt|presentation|slides?)\b", q_lower) and target_ext != ".pptx":
+        source_format_hint = ".pptx"
+    elif re.search(r"\b(?:this|my|the|from)?\s*(?:excel|spreadsheet|xlsx|xls)\b", q_lower) and target_ext != ".xlsx":
+        source_format_hint = ".xlsx"
+    elif re.search(r"\b(?:this|my|the|from)?\s*csv\b", q_lower) and target_ext != ".csv":
+        source_format_hint = ".csv"
+    elif re.search(r"\b(?:this|my|the|from)?\s*(?:image|photo|picture|png|jpg|jpeg|webp)\b", q_lower):
+        source_format_hint = "image"
+    elif re.search(r"\b(?:this|my|the|from)?\s*(?:markdown|md|txt|text(?:\s+file)?)\b", q_lower):
+        source_format_hint = "text"
+
+    # Normalize available documents
+    normalized_docs: List[Dict[str, Any]] = []
+    for d in (available_documents or []):
+        if isinstance(d, dict):
+            if d.get("status") in ("ready", None):
+                normalized_docs.append(d)
+        elif isinstance(d, str):
+            normalized_docs.append({"filename": d, "id": d, "status": "ready"})
+
+    if not normalized_docs:
+        return ConversionRequestInfo(
+            target_format=target_ext,
+            target_label=target_label,
+            source_format_hint=source_format_hint,
+            is_valid=False,
+            clarification_needed=(
+                f"No documents are currently attached to this chat session. "
+                f"Please upload a document before requesting conversion to {target_label}."
+            ),
+        )
+
+    # 5. Document Resolution:
+    # A) Check for explicit filename mention
+    matched_doc: Optional[Dict[str, Any]] = None
+    source_filename_hint: Optional[str] = None
+    for d in normalized_docs:
+        fn = d.get("filename", "")
+        stem = Path(fn).stem.lower()
+        if fn.lower() in q_lower or (len(stem) >= 4 and stem in q_lower):
+            matched_doc = d
+            source_filename_hint = fn
+            break
+
+    # B) Check by source format hint or compatibility
+    if not matched_doc:
+        candidates: List[Dict[str, Any]] = []
+        if source_format_hint:
+            for d in normalized_docs:
+                ext = Path(d.get("filename", "")).suffix.lower()
+                if source_format_hint == ".pdf" and ext == ".pdf":
+                    candidates.append(d)
+                elif source_format_hint == ".docx" and ext in (".docx", ".doc"):
+                    candidates.append(d)
+                elif source_format_hint == ".pptx" and ext in (".pptx", ".ppt"):
+                    candidates.append(d)
+                elif source_format_hint == ".xlsx" and ext in (".xlsx", ".xls"):
+                    candidates.append(d)
+                elif source_format_hint == ".csv" and ext == ".csv":
+                    candidates.append(d)
+                elif source_format_hint == "image" and ext in (".png", ".jpg", ".jpeg", ".webp"):
+                    candidates.append(d)
+                elif source_format_hint == "text" and ext in (".txt", ".md", ".markdown"):
+                    candidates.append(d)
+        else:
+            candidates = [
+                d for d in normalized_docs
+                if is_conversion_supported(Path(d.get("filename", "")).suffix.lower(), target_ext)
+            ]
+
+        # Further filter candidates to ensure conversion is supported
+        compatible_candidates = [
+            d for d in candidates
+            if is_conversion_supported(Path(d.get("filename", "")).suffix.lower(), target_ext)
+        ]
+
+        if len(compatible_candidates) == 1:
+            matched_doc = compatible_candidates[0]
+        elif len(compatible_candidates) > 1:
+            names = ", ".join(f"'{d.get('filename')}'" for d in compatible_candidates)
+            return ConversionRequestInfo(
+                target_format=target_ext,
+                target_label=target_label,
+                source_format_hint=source_format_hint,
+                is_valid=False,
+                clarification_needed=(
+                    f"You have multiple documents attached that can be converted to {target_label}: {names}. "
+                    f"Please specify which file you would like to convert."
+                ),
+            )
+        elif len(candidates) > 0 and len(compatible_candidates) == 0:
+            names = ", ".join(f"'{d.get('filename')}'" for d in candidates)
+            return ConversionRequestInfo(
+                target_format=target_ext,
+                target_label=target_label,
+                source_format_hint=source_format_hint,
+                is_valid=False,
+                clarification_needed=(
+                    f"The selected document(s) ({names}) cannot be converted to {target_label}. "
+                    f"Supported conversions for this format do not include {target_label}."
+                ),
+            )
+        else:
+            supported_srcs = sorted([k for k, v in SUPPORTED_CONVERSIONS.items() if target_ext in v])
+            return ConversionRequestInfo(
+                target_format=target_ext,
+                target_label=target_label,
+                source_format_hint=source_format_hint,
+                is_valid=False,
+                clarification_needed=(
+                    f"None of your attached documents can be converted to {target_label}. "
+                    f"Supported source formats for {target_label} are: {', '.join(supported_srcs)}."
+                ),
+            )
+
+    # C) Verify the matched document is compatible with target_ext
+    if matched_doc:
+        doc_ext = Path(matched_doc.get("filename", "")).suffix.lower()
+        if not is_conversion_supported(doc_ext, target_ext):
+            targets = get_supported_targets(doc_ext)
+            return ConversionRequestInfo(
+                target_format=target_ext,
+                target_label=target_label,
+                source_filename_hint=matched_doc.get("filename"),
+                matched_document=matched_doc,
+                is_valid=False,
+                clarification_needed=(
+                    f"Cannot convert '{matched_doc.get('filename')}' to {target_label}. "
+                    f"Supported formats for this file: {', '.join(targets) if targets else 'none'}."
+                ),
+            )
+        return ConversionRequestInfo(
+            target_format=target_ext,
+            target_label=target_label,
+            source_filename_hint=matched_doc.get("filename"),
+            matched_document=matched_doc,
+            is_valid=True,
+        )
+
+    return None

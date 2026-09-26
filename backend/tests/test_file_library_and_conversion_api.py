@@ -148,3 +148,61 @@ def test_auto_titling_on_first_message(auth_users):
     fetched = client.get(f"/api/chats/{chat_id}", headers=headers).json()
     assert fetched["title"] != "New Chat"
     assert "Explain the project architecture" in fetched["title"]
+
+
+def test_conversion_query_param_token_and_isolation(auth_users):
+    token_a = auth_users["token_a"]
+    token_b = auth_users["token_b"]
+    headers_a = auth_users["headers_a"]
+
+    # 1. Create chat and upload a document for User A
+    chat_res = client.post("/api/chats", json={"title": "Test Chat"}, headers=headers_a)
+    chat_id = chat_res.json()["id"]
+    csv_content = b"Col1,Col2\nVal1,Val2\n"
+    up_res = client.post(
+        f"/api/chats/{chat_id}/documents",
+        files={"file": ("test_token.csv", csv_content, "text/csv")},
+        headers=headers_a,
+    )
+    doc_id = up_res.json()["document"]["id"]
+
+    # 2. User A downloads converted XLSX using ?token= query parameter without Authorization header
+    res_a = client.get(f"/api/documents/{doc_id}/convert?target_format=xlsx&token={token_a}")
+    assert res_a.status_code == 200
+    assert len(res_a.content) > 0
+    assert 'attachment; filename="test_token.xlsx"' in res_a.headers.get("Content-Disposition", "")
+
+    # 3. User B attempts to download User A's file using User B's token -> 404 Not Found (User Isolation)
+    res_b = client.get(f"/api/documents/{doc_id}/convert?target_format=xlsx&token={token_b}")
+    assert res_b.status_code == 404
+
+    # 4. Request with no token or header -> 401 Unauthorized
+    res_anon = client.get(f"/api/documents/{doc_id}/convert?target_format=xlsx")
+    assert res_anon.status_code == 401
+
+
+def test_natural_language_conversion_in_chat(auth_users):
+    headers_a = auth_users["headers_a"]
+
+    # 1. Create chat and upload a CSV
+    chat_res = client.post("/api/chats", json={"title": "Conversion Chat"}, headers=headers_a)
+    chat_id = chat_res.json()["id"]
+    csv_content = b"Department,Budget\nEngineering,50000\nMarketing,30000\n"
+    client.post(
+        f"/api/chats/{chat_id}/documents",
+        files={"file": ("department_budget.csv", csv_content, "text/csv")},
+        headers=headers_a,
+    )
+
+    # 2. User asks natural language conversion query in chat
+    chat_query_res = client.post(
+        f"/api/chats/{chat_id}/chat",
+        json={"query": "Convert this document to Excel please"},
+        headers=headers_a,
+    )
+    assert chat_query_res.status_code == 200
+    ans = chat_query_res.json()["answer"]
+    assert "Successfully converted" in ans or "download" in ans.lower()
+    assert "department_budget.xlsx" in ans
+    assert "/api/documents/" in ans
+    assert "token=" in ans
